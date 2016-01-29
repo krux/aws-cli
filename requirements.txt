@@ -4,8 +4,12 @@ Sphinx==1.1.3
 # botocore and the awscli packages are typically developed
 # in tandem, so we're requiring the latest develop
 # branch of botocore when working on the awscli.
--e git://github.com/boto/botocore.git@develop#egg=botocore
--e git://github.com/boto/jmespath.git@develop#egg=jmespath
+#-e git://github.com/boto/botocore.git@develop#egg=botocore
+# Pin to the specific botocore, not upstream develop branch
+botocore==1.3.23
+#-e git://github.com/boto/jmespath.git@develop#egg=jmespath
+# Pin to the specific jmespath, not upstream develop branch
+jmespath==0.9.0
 nose==1.3.0
 colorama>=0.2.5,<=0.3.3
 mock==1.0.1
