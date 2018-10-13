@@ -11,31 +11,27 @@
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
 import argparse
+import logging
 from datetime import datetime
 import mimetypes
-import hashlib
-import math
 import errno
 import os
-import sys
+import time
 from collections import namedtuple, deque
-from functools import partial
 
 from dateutil.parser import parse
 from dateutil.tz import tzlocal, tzutc
-from botocore.compat import unquote_str
+from s3transfer.subscribers import BaseSubscriber
 
-from awscli.compat import six
-from awscli.compat import PY3
+from awscli.compat import bytes_print
 from awscli.compat import queue
 
+LOGGER = logging.getLogger(__name__)
 HUMANIZE_SUFFIXES = ('KiB', 'MiB', 'GiB', 'TiB', 'PiB', 'EiB')
-MAX_PARTS = 10000
 EPOCH_TIME = datetime(1970, 1, 1, tzinfo=tzutc())
-# The maximum file size you can upload via S3 per request.
-# See: http://docs.aws.amazon.com/AmazonS3/latest/dev/UploadingObjects.html
-# and: http://docs.aws.amazon.com/AmazonS3/latest/dev/qfacts.html
-MAX_SINGLE_UPLOAD_SIZE = 5 * (1024 ** 3)
+# Maximum object size allowed in S3.
+# See: http://docs.aws.amazon.com/AmazonS3/latest/dev/qfacts.html
+MAX_UPLOAD_SIZE = 5 * (1024 ** 4)
 SIZE_SUFFIX = {
     'kb': 1024,
     'mb': 1024 ** 2,
@@ -46,7 +42,6 @@ SIZE_SUFFIX = {
     'gib': 1024 ** 3,
     'tib': 1024 ** 4,
 }
-
 
 
 def human_readable_size(value):
@@ -132,10 +127,7 @@ class AppendFilter(argparse.Action):
         setattr(namespace, self.dest, filter_list)
 
 
-class MD5Error(Exception):
-    """
-    Exception for md5's that do not match.
-    """
+class CreateDirectoryError(Exception):
     pass
 
 
@@ -223,13 +215,13 @@ def get_file_stat(path):
 
     try:
         update_time = datetime.fromtimestamp(stats.st_mtime, tzlocal())
-    except ValueError:
+    except (ValueError, OSError, OverflowError):
         # Python's fromtimestamp raises value errors when the timestamp is out
         # of range of the platform's C localtime() function. This can cause
-        # issues when syncing from systems with a wide range of valid timestamps
-        # to systems with a lower range. Some systems support 64-bit timestamps,
-        # for instance, while others only support 32-bit. We don't want to fail
-        # in these cases, so instead we pass along none.
+        # issues when syncing from systems with a wide range of valid
+        # timestamps to systems with a lower range. Some systems support
+        # 64-bit timestamps, for instance, while others only support 32-bit.
+        # We don't want to fail in these cases, so instead we pass along none.
         update_time = None
 
     return stats.st_size, update_time
@@ -271,91 +263,26 @@ def create_warning(path, error_message, skip_file=True):
     if skip_file:
         print_string = print_string + "Skipping file " + path + ". "
     print_string = print_string + error_message
-    warning_message = PrintTask(message=print_string, error=False,
-                                warning=True)
+    warning_message = WarningResult(message=print_string, error=False,
+                                    warning=True)
     return warning_message
 
 
-def find_chunksize(size, current_chunksize):
+class StdoutBytesWriter(object):
     """
-    The purpose of this function is determine a chunksize so that
-    the number of parts in a multipart upload is not greater than
-    the ``MAX_PARTS``.  If the ``chunksize`` is greater than
-    ``MAX_SINGLE_UPLOAD_SIZE`` it returns ``MAX_SINGLE_UPLOAD_SIZE``.
+    This class acts as a file-like object that performs the bytes_print
+    function on write.
     """
-    chunksize = current_chunksize
-    num_parts = int(math.ceil(size / float(chunksize)))
-    while num_parts > MAX_PARTS:
-        chunksize *= 2
-        num_parts = int(math.ceil(size / float(chunksize)))
-    if chunksize > MAX_SINGLE_UPLOAD_SIZE:
-        return MAX_SINGLE_UPLOAD_SIZE
-    else:
-        return chunksize
+    def __init__(self, stdout=None):
+        self._stdout = stdout
 
+    def write(self, b):
+        """
+        Writes data to stdout as bytes.
 
-class MultiCounter(object):
-    """
-    This class is used as a way to keep track of how many multipart
-    operations are in progress.  It also is used to track how many
-    part operations are occuring.
-    """
-    def __init__(self):
-        self.count = 0
-
-
-def uni_print(statement, out_file=None):
-    """
-    This function is used to properly write unicode to a file, usually
-    stdout or stdderr.  It ensures that the proper encoding is used if the
-    statement is not a string type.
-    """
-    if out_file is None:
-        out_file = sys.stdout
-    try:
-        # Otherwise we assume that out_file is a
-        # text writer type that accepts str/unicode instead
-        # of bytes.
-        out_file.write(statement)
-    except UnicodeEncodeError:
-        # Some file like objects like cStringIO will
-        # try to decode as ascii on python2.
-        #
-        # This can also fail if our encoding associated
-        # with the text writer cannot encode the unicode
-        # ``statement`` we've been given.  This commonly
-        # happens on windows where we have some S3 key
-        # previously encoded with utf-8 that can't be
-        # encoded using whatever codepage the user has
-        # configured in their console.
-        #
-        # At this point we've already failed to do what's
-        # been requested.  We now try to make a best effort
-        # attempt at printing the statement to the outfile.
-        # We're using 'ascii' as the default because if the
-        # stream doesn't give us any encoding information
-        # we want to pick an encoding that has the highest
-        # chance of printing successfully.
-        new_encoding = getattr(out_file, 'encoding', 'ascii')
-        new_statement = statement.encode(
-            new_encoding, 'replace').decode(new_encoding)
-        out_file.write(new_statement)
-    out_file.flush()
-
-
-def bytes_print(statement):
-    """
-    This function is used to properly write bytes to standard out.
-    """
-    if PY3:
-        if getattr(sys.stdout, 'buffer', None):
-            sys.stdout.buffer.write(statement)
-        else:
-            # If it is not possible to write to the standard out buffer.
-            # The next best option is to decode and write to standard out.
-            sys.stdout.write(statement.decode('utf-8'))
-    else:
-        sys.stdout.write(statement)
+        :param b: data to write
+        """
+        bytes_print(b, self._stdout)
 
 
 def guess_content_type(filename):
@@ -363,7 +290,21 @@ def guess_content_type(filename):
 
     If the type cannot be guessed, a value of None is returned.
     """
-    return mimetypes.guess_type(filename)[0]
+    try:
+        return mimetypes.guess_type(filename)[0]
+    # This catches a bug in the mimetype libary where some MIME types
+    # specifically on windows machines cause a UnicodeDecodeError
+    # because the MIME type in the Windows registery has an encoding
+    # that cannot be properly encoded using the default system encoding.
+    # https://bugs.python.org/issue9291
+    #
+    # So instead of hard failing, just log the issue and fall back to the
+    # default guessed content type of None.
+    except UnicodeDecodeError:
+        LOGGER.debug(
+            'Unable to guess content type for %s due to '
+            'UnicodeDecodeError: ', filename, exc_info=True
+        )
 
 
 def relative_path(filename, start=os.path.curdir):
@@ -406,66 +347,6 @@ class SetFileUtimeError(Exception):
     pass
 
 
-class ReadFileChunk(object):
-    def __init__(self, filename, start_byte, size):
-        self._filename = filename
-        self._start_byte = start_byte
-        self._fileobj = open(self._filename, 'rb')
-        self._size = self._calculate_file_size(self._fileobj, requested_size=size,
-                                               start_byte=start_byte)
-        self._fileobj.seek(self._start_byte)
-        self._amount_read = 0
-
-    def _calculate_file_size(self, fileobj, requested_size, start_byte):
-        actual_file_size = os.fstat(fileobj.fileno()).st_size
-        max_chunk_size = actual_file_size - start_byte
-        return min(max_chunk_size, requested_size)
-
-    def read(self, amount=None):
-        if amount is None:
-            remaining = self._size - self._amount_read
-            data = self._fileobj.read(remaining)
-            self._amount_read += remaining
-            return data
-        else:
-            actual_amount = min(self._size - self._amount_read, amount)
-            data = self._fileobj.read(actual_amount)
-            self._amount_read += actual_amount
-            return data
-
-    def seek(self, where):
-        self._fileobj.seek(self._start_byte + where)
-        self._amount_read = where
-
-    def close(self):
-        self._fileobj.close()
-
-    def tell(self):
-        return self._amount_read
-
-    def __len__(self):
-        # __len__ is defined because requests will try to determine the length
-        # of the stream to set a content length.  In the normal case
-        # of the file it will just stat the file, but we need to change that
-        # behavior.  By providing a __len__, requests will use that instead
-        # of stat'ing the file.
-        return self._size
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args, **kwargs):
-        self._fileobj.close()
-
-    def __iter__(self):
-        # This is a workaround for http://bugs.python.org/issue17575
-        # Basically httplib will try to iterate over the contents, even
-        # if its a file like object.  This wasn't noticed because we've
-        # already exhausted the stream so iterating over the file immediately
-        # steps, which is what we're simulating here.
-        return iter([])
-
-
 def _date_parser(date_string):
     return parse(date_string).astimezone(tzlocal())
 
@@ -476,12 +357,15 @@ class BucketLister(object):
         self._client = client
         self._date_parser = date_parser
 
-    def list_objects(self, bucket, prefix=None, page_size=None):
+    def list_objects(self, bucket, prefix=None, page_size=None,
+                     extra_args=None):
         kwargs = {'Bucket': bucket, 'PaginationConfig': {'PageSize': page_size}}
         if prefix is not None:
             kwargs['Prefix'] = prefix
+        if extra_args is not None:
+            kwargs.update(extra_args)
 
-        paginator = self._client.get_paginator('list_objects')
+        paginator = self._client.get_paginator('list_objects_v2')
         pages = paginator.paginate(**kwargs)
         for page in pages:
             contents = page.get('Contents', [])
@@ -505,15 +389,7 @@ class PrintTask(namedtuple('PrintTask',
         return super(PrintTask, cls).__new__(cls, message, error, total_parts,
                                              warning)
 
-
-IORequest = namedtuple('IORequest',
-                       ['filename', 'offset', 'data', 'is_stream'])
-# Used to signal that IO for the filename is finished, and that
-# any associated resources may be cleaned up.
-_IOCloseRequest = namedtuple('IOCloseRequest', ['filename', 'desired_mtime'])
-class IOCloseRequest(_IOCloseRequest):
-    def __new__(cls, filename, desired_mtime=None):
-        return super(IOCloseRequest, cls).__new__(cls, filename, desired_mtime)
+WarningResult = PrintTask
 
 
 class RequestParamsMapper(object):
@@ -551,11 +427,13 @@ class RequestParamsMapper(object):
         cls._set_metadata_params(request_params, cli_params)
         cls._set_sse_request_params(request_params, cli_params)
         cls._set_sse_c_request_params(request_params, cli_params)
+        cls._set_request_payer_param(request_params, cli_params)
 
     @classmethod
     def map_get_object_params(cls, request_params, cli_params):
         """Map CLI params to GetObject request params"""
         cls._set_sse_c_request_params(request_params, cli_params)
+        cls._set_request_payer_param(request_params, cli_params)
 
     @classmethod
     def map_copy_object_params(cls, request_params, cli_params):
@@ -567,11 +445,13 @@ class RequestParamsMapper(object):
         cls._set_sse_request_params(request_params, cli_params)
         cls._set_sse_c_and_copy_source_request_params(
             request_params, cli_params)
+        cls._set_request_payer_param(request_params, cli_params)
 
     @classmethod
     def map_head_object_params(cls, request_params, cli_params):
         """Map CLI params to HeadObject request params"""
         cls._set_sse_c_request_params(request_params, cli_params)
+        cls._set_request_payer_param(request_params, cli_params)
 
     @classmethod
     def map_create_multipart_upload_params(cls, request_params, cli_params):
@@ -580,21 +460,37 @@ class RequestParamsMapper(object):
         cls._set_sse_request_params(request_params, cli_params)
         cls._set_sse_c_request_params(request_params, cli_params)
         cls._set_metadata_params(request_params, cli_params)
+        cls._set_request_payer_param(request_params, cli_params)
 
     @classmethod
     def map_upload_part_params(cls, request_params, cli_params):
         """Map CLI params to UploadPart request params"""
         cls._set_sse_c_request_params(request_params, cli_params)
+        cls._set_request_payer_param(request_params, cli_params)
 
     @classmethod
     def map_upload_part_copy_params(cls, request_params, cli_params):
         """Map CLI params to UploadPartCopy request params"""
         cls._set_sse_c_and_copy_source_request_params(
             request_params, cli_params)
+        cls._set_request_payer_param(request_params, cli_params)
+
+    @classmethod
+    def map_delete_object_params(cls, request_params, cli_params):
+        cls._set_request_payer_param(request_params, cli_params)
+
+    @classmethod
+    def map_list_objects_v2_params(cls, request_params, cli_params):
+        cls._set_request_payer_param(request_params, cli_params)
+
+    @classmethod
+    def _set_request_payer_param(cls, request_params, cli_params):
+        if cli_params.get('request_payer'):
+            request_params['RequestPayer'] = cli_params['request_payer']
 
     @classmethod
     def _set_general_object_params(cls, request_params, cli_params):
-        # Paramters set in this method should be applicable to the following
+        # Parameters set in this method should be applicable to the following
         # operations involving objects: PutObject, CopyObject, and
         # CreateMultipartUpload.
         general_param_translation = {
@@ -681,3 +577,176 @@ class RequestParamsMapper(object):
                                                   cli_params):
         cls._set_sse_c_request_params(request_params, cli_params)
         cls._set_sse_c_copy_source_request_params(request_params, cli_params)
+
+
+class ProvideSizeSubscriber(BaseSubscriber):
+    """
+    A subscriber which provides the transfer size before it's queued.
+    """
+    def __init__(self, size):
+        self.size = size
+
+    def on_queued(self, future, **kwargs):
+        future.meta.provide_transfer_size(self.size)
+
+
+# TODO: Eventually port this down to the BaseSubscriber or a new subscriber
+# class in s3transfer. The functionality is very convenient but may need
+# some further design decisions to make it a feature in s3transfer.
+class OnDoneFilteredSubscriber(BaseSubscriber):
+    """Subscriber that differentiates between successes and failures
+
+    It is really a convenience class so developers do not have to have
+    to constantly remember to have a general try/except around future.result()
+    """
+    def on_done(self, future, **kwargs):
+        future_exception = None
+        try:
+
+            future.result()
+        except Exception as e:
+            future_exception = e
+        # If the result propogates an error, call the on_failure
+        # method instead.
+        if future_exception:
+            self._on_failure(future, future_exception)
+        else:
+            self._on_success(future)
+
+    def _on_success(self, future):
+        pass
+
+    def _on_failure(self, future, e):
+        pass
+
+
+class DeleteSourceSubscriber(OnDoneFilteredSubscriber):
+    """A subscriber which deletes the source of the transfer."""
+    def _on_success(self, future):
+        try:
+            self._delete_source(future)
+        except Exception as e:
+            future.set_exception(e)
+
+    def _delete_source(self, future):
+        raise NotImplementedError('_delete_source()')
+
+
+class DeleteSourceObjectSubscriber(DeleteSourceSubscriber):
+    """A subscriber which deletes an object."""
+    def __init__(self, client):
+        self._client = client
+
+    def _get_bucket(self, call_args):
+        return call_args.bucket
+
+    def _get_key(self, call_args):
+        return call_args.key
+
+    def _delete_source(self, future):
+        call_args = future.meta.call_args
+        delete_object_kwargs = {
+            'Bucket': self._get_bucket(call_args),
+            'Key': self._get_key(call_args)
+        }
+        if call_args.extra_args.get('RequestPayer'):
+            delete_object_kwargs['RequestPayer'] = call_args.extra_args[
+                'RequestPayer']
+        self._client.delete_object(**delete_object_kwargs)
+
+
+class DeleteCopySourceObjectSubscriber(DeleteSourceObjectSubscriber):
+    """A subscriber which deletes the copy source."""
+    def _get_bucket(self, call_args):
+        return call_args.copy_source['Bucket']
+
+    def _get_key(self, call_args):
+        return call_args.copy_source['Key']
+
+
+class DeleteSourceFileSubscriber(DeleteSourceSubscriber):
+    """A subscriber which deletes a file."""
+    def _delete_source(self, future):
+        os.remove(future.meta.call_args.fileobj)
+
+
+class BaseProvideContentTypeSubscriber(BaseSubscriber):
+    """A subscriber that provides content type when creating s3 objects"""
+
+    def on_queued(self, future, **kwargs):
+        guessed_type = guess_content_type(self._get_filename(future))
+        if guessed_type is not None:
+            future.meta.call_args.extra_args['ContentType'] = guessed_type
+
+    def _get_filename(self, future):
+        raise NotImplementedError('_get_filename()')
+
+
+class ProvideUploadContentTypeSubscriber(BaseProvideContentTypeSubscriber):
+    def _get_filename(self, future):
+        return future.meta.call_args.fileobj
+
+
+class ProvideCopyContentTypeSubscriber(BaseProvideContentTypeSubscriber):
+    def _get_filename(self, future):
+        return future.meta.call_args.copy_source['Key']
+
+
+class ProvideLastModifiedTimeSubscriber(OnDoneFilteredSubscriber):
+    """Sets utime for a downloaded file"""
+    def __init__(self, last_modified_time, result_queue):
+        self._last_modified_time = last_modified_time
+        self._result_queue = result_queue
+
+    def _on_success(self, future, **kwargs):
+        filename = future.meta.call_args.fileobj
+        try:
+            last_update_tuple = self._last_modified_time.timetuple()
+            mod_timestamp = time.mktime(last_update_tuple)
+            set_file_utime(filename, int(mod_timestamp))
+        except Exception as e:
+            warning_message = (
+                'Successfully Downloaded %s but was unable to update the '
+                'last modified time. %s' % (filename, e))
+            self._result_queue.put(create_warning(filename, warning_message))
+
+
+class DirectoryCreatorSubscriber(BaseSubscriber):
+    """Creates a directory to download if it does not exist"""
+    def on_queued(self, future, **kwargs):
+        d = os.path.dirname(future.meta.call_args.fileobj)
+        try:
+            if not os.path.exists(d):
+                os.makedirs(d)
+        except OSError as e:
+            if not e.errno == errno.EEXIST:
+                raise CreateDirectoryError(
+                    "Could not create directory %s: %s" % (d, e))
+
+
+class NonSeekableStream(object):
+    """Wrap a file like object as a non seekable stream.
+
+    This class is used to wrap an existing file like object
+    such that it only has a ``.read()`` method.
+
+    There are some file like objects that aren't truly seekable
+    but appear to be.  For example, on windows, sys.stdin has
+    a ``seek()`` method, and calling ``seek(0)`` even appears
+    to work.  However, subsequent ``.read()`` calls will just
+    return an empty string.
+
+    Consumers of these file like object have no way of knowing
+    if these files are truly seekable or not, so this class
+    can be used to force non-seekable behavior when you know
+    for certain that a fileobj is non seekable.
+
+    """
+    def __init__(self, fileobj):
+        self._fileobj = fileobj
+
+    def read(self, amt=None):
+        if amt is None:
+            return self._fileobj.read()
+        else:
+            return self._fileobj.read(amt)

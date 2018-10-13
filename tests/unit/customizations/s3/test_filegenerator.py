@@ -19,10 +19,10 @@ import tempfile
 import shutil
 import socket
 
+from botocore.exceptions import ClientError
 from awscli.compat import six
 import mock
 
-from awscli.errorhandler import ClientError
 from awscli.customizations.s3.filegenerator import FileGenerator, \
     FileDecodingError, FileStat, is_special_file, is_readable
 from awscli.customizations.s3.utils import get_file_stat, EPOCH_TIME
@@ -524,12 +524,34 @@ class S3FileGeneratorTest(BaseAWSCommandParamsTest):
         params = {'region': 'us-east-1'}
         self.client = mock.Mock()
         self.client.head_object.side_effect = \
-            ClientError(404, 'Not Found', '404', 'HeadObject', 404)
+                ClientError(
+                    {'Error': {'Code': '404', 'Message': 'Not Found'}},
+                    'HeadObject',
+                )
         file_gen = FileGenerator(self.client, '')
         files = file_gen.call(input_s3_file)
         # The error should include 404 and should include the key name.
         with self.assertRaisesRegexp(ClientError, '404.*text1.txt'):
             list(files)
+
+    def test_s3_single_file_delete(self):
+        input_s3_file = {'src': {'path': self.file1, 'type': 's3'},
+                         'dest': {'path': '', 'type': 'local'},
+                         'dir_op': False, 'use_src_name': True}
+        self.client = mock.Mock()
+        file_gen = FileGenerator(self.client, 'delete')
+        result_list = list(file_gen.call(input_s3_file))
+        self.assertEqual(len(result_list), 1)
+        compare_files(
+            self,
+            result_list[0],
+            FileStat(src=self.file1, dest='text1.txt',
+                     compare_key='text1.txt',
+                     size=None, last_update=None,
+                     src_type='s3', dest_type='local',
+                     operation_name='delete')
+        )
+        self.client.head_object.assert_not_called()
 
     def test_s3_directory(self):
         """

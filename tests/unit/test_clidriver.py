@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # Copyright 2012-2013 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"). You
@@ -13,10 +14,13 @@
 from awscli.testutils import unittest
 from awscli.testutils import BaseAWSCommandParamsTest
 import logging
+import io
+import sys
 
 import mock
+import nose
 from awscli.compat import six
-from botocore.vendored.requests import models
+from botocore.awsrequest import AWSResponse
 from botocore.exceptions import NoCredentialsError
 from botocore.compat import OrderedDict
 import botocore.model
@@ -28,6 +32,7 @@ from awscli.clidriver import CustomArgument
 from awscli.clidriver import CLICommand
 from awscli.clidriver import ServiceCommand
 from awscli.clidriver import ServiceOperation
+from awscli.paramfile import URIArgumentHandler
 from awscli.customizations.commands import BasicCommand
 from awscli import formatter
 from awscli.argparser import HELP_BLURB
@@ -95,6 +100,7 @@ GET_DATA = {
 GET_VARIABLE = {
     'provider': 'aws',
     'output': 'json',
+    'api_versions': {}
 }
 
 
@@ -116,6 +122,15 @@ MINI_SERVICE = {
       "input":{"shape":"ListObjectsRequest"},
       "output":{"shape":"ListObjectsOutput"},
     },
+    "IdempotentOperation":{
+      "name":"IdempotentOperation",
+      "http":{
+        "method":"GET",
+        "requestUri":"/{Bucket}"
+      },
+      "input":{"shape":"IdempotentOperationRequest"},
+      "output":{"shape":"ListObjectsOutput"},
+    },
   },
   "shapes":{
     "ListObjectsOutput":{
@@ -129,6 +144,16 @@ MINI_SERVICE = {
           "shape":"NextMarker",
         },
         "Contents":{"shape":"Contents"},
+      },
+    },
+    "IdempotentOperationRequest":{
+      "type":"structure",
+      "required": "token",
+      "members":{
+        "token":{
+          "shape":"Token",
+          "idempotencyToken": True,
+        },
       }
     },
     "ListObjectsRequest":{
@@ -158,6 +183,7 @@ MINI_SERVICE = {
     "IsTruncated":{"type":"boolean"},
     "NextMarker":{"type":"string"},
     "Contents":{"type":"string"},
+    "Token":{"type":"string"},
   }
 }
 
@@ -203,9 +229,9 @@ class FakeSession(object):
     def get_config_variable(self, name):
         return GET_VARIABLE[name]
 
-    def get_service_model(self, name):
-        return botocore.model.ServiceModel(MINI_SERVICE,
-                                           service_name='s3')
+    def get_service_model(self, name, api_version=None):
+        return botocore.model.ServiceModel(
+            MINI_SERVICE, service_name='s3')
 
     def user_agent(self):
         return 'user_agent'
@@ -277,6 +303,27 @@ class TestCliDriver(unittest.TestCase):
         driver.session.create_client = mock.Mock(return_value=fake_client)
         rc = driver.main('s3 list-objects --bucket foo'.split())
         self.assertEqual(rc, 130)
+
+    def test_error_unicode(self):
+        # We need a different type for Py3 and Py2 because on Py3 six.StringIO
+        # doesn't let us set the encoding and returns a string.
+        if six.PY3:
+            stderr_b = io.BytesIO()
+            stderr = io.TextIOWrapper(stderr_b, encoding="UTF-8")
+        else:
+            stderr = stderr_b = six.StringIO()
+            stderr.encoding = "UTF-8"
+        driver = CLIDriver(session=self.session)
+        fake_client = mock.Mock()
+        fake_client.list_objects.side_effect = Exception(u"☃")
+        fake_client.can_paginate.return_value = False
+        driver.session.create_client = mock.Mock(return_value=fake_client)
+        with mock.patch("sys.stderr", stderr):
+            with mock.patch("locale.getpreferredencoding", lambda: "UTF-8"):
+                rc = driver.main('s3 list-objects --bucket foo'.split())
+        stderr.flush()
+        self.assertEqual(rc, 255)
+        self.assertEqual(stderr_b.getvalue().strip(), u"☃".encode("UTF-8"))
 
 
 class TestCliDriverHooks(unittest.TestCase):
@@ -464,39 +511,60 @@ class TestAWSCommand(BaseAWSCommandParamsTest):
         self.assertEqual(len(args_seen), 1)
         self.assertEqual(args_seen[0].unknown_arg, 'foo')
 
-    def test_custom_arg_paramfile(self):
-        with mock.patch('awscli.handlers.uri_param',
-                        return_value=None) as uri_param_mock:
-            driver = create_clidriver()
-            driver.session.register(
-                'building-argument-table', self.inject_new_param)
+    @mock.patch('awscli.paramfile.URIArgumentHandler',
+                spec=URIArgumentHandler)
+    def test_custom_arg_paramfile(self, mock_handler):
+        mock_paramfile = mock.Mock(autospec=True)
+        mock_paramfile.return_value = None
+        mock_handler.return_value = mock_paramfile
 
-            self.patch_make_request()
-            rc = driver.main(
-                'ec2 describe-instances --unknown-arg file:///foo'.split())
+        driver = create_clidriver()
+        driver.session.register(
+            'building-argument-table', self.inject_new_param)
 
-            self.assertEqual(rc, 0)
+        self.patch_make_request()
+        rc = driver.main(
+            'ec2 describe-instances --unknown-arg file:///foo'.split())
 
-            # Make sure uri_param was called
-            uri_param_mock.assert_called()
-            # Make sure it was called with our passed-in URI
-            self.assertEqual('file:///foo',
-                             uri_param_mock.call_args_list[-1][1]['value'])
+        self.assertEqual(rc, 0)
 
-    def test_custom_command_paramfile(self):
-        with mock.patch('awscli.handlers.uri_param',
-                        return_value=None) as uri_param_mock:
-            driver = create_clidriver()
-            driver.session.register(
-                'building-command-table', self.inject_command)
+        # Make sure uri_param was called
+        mock_paramfile.assert_any_call(
+            event_name='load-cli-arg.ec2.describe-instances.unknown-arg',
+            operation_name='describe-instances',
+            param=mock.ANY,
+            service_name='ec2',
+            value='file:///foo',
+        )
+        # Make sure it was called with our passed-in URI
+        self.assertEqual(
+            'file:///foo',
+            mock_paramfile.call_args_list[-1][1]['value'])
 
-            self.patch_make_request()
-            rc = driver.main(
-                'ec2 foo --bar file:///foo'.split())
+    @mock.patch('awscli.paramfile.URIArgumentHandler',
+                spec=URIArgumentHandler)
+    def test_custom_command_paramfile(self, mock_handler):
+        mock_paramfile = mock.Mock(autospec=True)
+        mock_paramfile.return_value = None
+        mock_handler.return_value = mock_paramfile
 
-            self.assertEqual(rc, 0)
+        driver = create_clidriver()
+        driver.session.register(
+            'building-command-table', self.inject_command)
 
-            uri_param_mock.assert_called()
+        self.patch_make_request()
+        rc = driver.main(
+            'ec2 foo --bar file:///foo'.split())
+
+        self.assertEqual(rc, 0)
+
+        mock_paramfile.assert_any_call(
+            event_name='load-cli-arg.custom.foo.bar',
+            operation_name='foo',
+            param=mock.ANY,
+            service_name='custom',
+            value='file:///foo',
+        )
 
     @unittest.skip
     def test_custom_arg_no_paramfile(self):
@@ -625,28 +693,31 @@ class TestAWSCommand(BaseAWSCommandParamsTest):
 
     def test_help_blurb_in_operation_error_message(self):
         with self.assertRaises(SystemExit):
-            self.driver.main(['ec2', 'run-instances'])
+            self.driver.main(['s3api', 'list-objects'])
         self.assertIn(HELP_BLURB, self.stderr.getvalue())
 
     def test_help_blurb_in_unknown_argument_error_message(self):
         with self.assertRaises(SystemExit):
-            self.driver.main(['ec2', 'run-instances', '--help'])
+            self.driver.main(['s3api', 'list-objects', '--help'])
         self.assertIn(HELP_BLURB, self.stderr.getvalue())
 
+    def test_idempotency_token_is_not_required_in_help_text(self):
+        with self.assertRaises(SystemExit):
+            self.driver.main(['servicecatalog', 'create-constraint'])
+        self.assertNotIn('--idempotency-token', self.stderr.getvalue())
 
 class TestHowClientIsCreated(BaseAWSCommandParamsTest):
     def setUp(self):
         super(TestHowClientIsCreated, self).setUp()
         self.endpoint_creator_patch = mock.patch(
-            'botocore.client.EndpointCreator')
+            'botocore.args.EndpointCreator')
         self.endpoint_creator = self.endpoint_creator_patch.start()
         self.create_endpoint = \
                 self.endpoint_creator.return_value.create_endpoint
         self.endpoint = self.create_endpoint.return_value
         self.endpoint.host = 'https://example.com'
         # Have the endpoint give a dummy empty response.
-        http_response = models.Response()
-        http_response.status_code = 200
+        http_response = AWSResponse(None, 200, {}, None)
         self.endpoint.make_request.return_value = (
             http_response, {})
 
@@ -665,8 +736,8 @@ class TestHowClientIsCreated(BaseAWSCommandParamsTest):
         self.assert_params_for_cmd(
             'ec2 describe-instances --region us-west-2',
             expected_rc=0)
-        self.assertEqual(self.create_endpoint.call_args[0],
-                         (mock.ANY, 'us-west-2'))
+        self.assertEqual(
+            self.create_endpoint.call_args[1]['region_name'], 'us-west-2')
 
     def test_aws_with_verify_false(self):
         self.assert_params_for_cmd(
@@ -675,7 +746,6 @@ class TestHowClientIsCreated(BaseAWSCommandParamsTest):
         # Because we used --no-verify-ssl, create_endpoint should be
         # called with verify=False
         call_args = self.create_endpoint.call_args
-        self.assertEqual(call_args[0], (mock.ANY, 'us-east-1'))
         self.assertFalse(call_args[1]['verify'])
 
     def test_aws_with_cacert_env_var(self):
@@ -684,7 +754,6 @@ class TestHowClientIsCreated(BaseAWSCommandParamsTest):
             'ec2 describe-instances --region us-east-1',
             expected_rc=0)
         call_args = self.create_endpoint.call_args
-        self.assertEqual(call_args[0], (mock.ANY, 'us-east-1'))
         self.assertEqual(call_args[1]['verify'], '/path/cacert.pem')
 
     def test_aws_with_read_timeout(self):
@@ -742,7 +811,7 @@ class TestHTTPParamFileDoesNotExist(BaseAWSCommandParamsTest):
         error_msg = ("Error parsing parameter '--filters': "
                      "Unable to retrieve http://does/not/exist.json: "
                      "received non 200 status code of 404")
-        with mock.patch('botocore.vendored.requests.get') as get:
+        with mock.patch('awscli.paramfile.URLLib3Session.send') as get:
             get.return_value.status_code = 404
             self.assert_params_for_cmd(
                 'ec2 describe-instances --filters http://does/not/exist.json',
@@ -837,7 +906,10 @@ class TestServiceCommand(unittest.TestCase):
 class TestServiceOperation(unittest.TestCase):
     def setUp(self):
         self.name = 'foo'
-        self.cmd = ServiceOperation(self.name, None, None, None, None)
+        operation = mock.Mock(spec=botocore.model.OperationModel)
+        operation.deprecated = False
+        self.mock_operation = operation
+        self.cmd = ServiceOperation(self.name, None, None, operation, None)
 
     def test_name(self):
         self.assertEqual(self.cmd.name, self.name)
@@ -852,6 +924,23 @@ class TestServiceOperation(unittest.TestCase):
 
     def test_lineage_names(self):
         self.assertEqual(self.cmd.lineage_names, ['foo'])
+
+    def test_deprecated_operation(self):
+        self.mock_operation.deprecated = True
+        cmd = ServiceOperation(self.name, None, None, self.mock_operation,
+                               None)
+        self.assertTrue(getattr(cmd, '_UNDOCUMENTED'))
+
+    def test_idempotency_token_is_not_required(self):
+        session = FakeSession()
+        name = 'IdempotentOperation'
+        service_model = session.get_service_model('s3')
+        operation_model = service_model.operation_model(name)
+        cmd = ServiceOperation(name, None, None, operation_model, session)
+        arg_table = cmd.arg_table
+        token_argument = arg_table.get('token')
+        self.assertFalse(token_argument.required,
+                         'Idempotency tokens should not be required')
 
 
 if __name__ == '__main__':

@@ -15,6 +15,7 @@ Utility functions to make it easier to work with customizations.
 
 """
 import copy
+import sys
 
 from botocore.exceptions import ClientError
 
@@ -24,6 +25,14 @@ def rename_argument(argument_table, existing_name, new_name):
     argument_table[new_name] = current
     current.name = new_name
     del argument_table[existing_name]
+
+
+def _copy_argument(argument_table, current_name, copy_name):
+    current = argument_table[current_name]
+    copy_arg = copy.copy(current)
+    copy_arg.name = copy_name
+    argument_table[copy_name] = copy_arg
+    return copy_arg
 
 
 def make_hidden_alias(argument_table, existing_name, alias_name):
@@ -39,10 +48,16 @@ def make_hidden_alias(argument_table, existing_name, alias_name):
 
     """
     current = argument_table[existing_name]
-    copy_arg = copy.copy(current)
+    copy_arg = _copy_argument(argument_table, existing_name, alias_name)
     copy_arg._UNDOCUMENTED = True
-    copy_arg.name = alias_name
-    argument_table[alias_name] = copy_arg
+    if current.required:
+        # If the current argument is required, then
+        # we'll mark both as not required, but
+        # flag _DOCUMENT_AS_REQUIRED so our doc gen
+        # knows to still document this argument as required.
+        copy_arg.required = False
+        current.required = False
+        current._DOCUMENT_AS_REQUIRED = True
 
 
 def rename_command(command_table, existing_name, new_name):
@@ -50,6 +65,46 @@ def rename_command(command_table, existing_name, new_name):
     command_table[new_name] = current
     current.name = new_name
     del command_table[existing_name]
+
+
+def alias_command(command_table, existing_name, new_name):
+    """Moves an argument to a new name, keeping the old as a hidden alias.
+
+    :type command_table: dict
+    :param command_table: The full command table for the CLI or a service.
+
+    :type existing_name: str
+    :param existing_name: The current name of the command.
+
+    :type new_name: str
+    :param new_name: The new name for the command.
+    """
+    current = command_table[existing_name]
+    _copy_argument(command_table, existing_name, new_name)
+    current._UNDOCUMENTED = True
+
+
+def make_hidden_command_alias(command_table, existing_name, alias_name):
+    """Create a hidden alias for an exiting command.
+
+    This will copy an existing command object in a command table and add a new
+    entry to the command table with a different name. The new command will
+    be undocumented.
+
+    This is needed if you want to change an existing command, but you still
+    need the old name to work for backwards compatibility reasons.
+
+    :type command_table: dict
+    :param command_table: The full command table for the CLI or a service.
+
+    :type existing_name: str
+    :param existing_name: The current name of the command.
+
+    :type alias_name: str
+    :param alias_name: The new name for the command.
+    """
+    new = _copy_argument(command_table, existing_name, alias_name)
+    new._UNDOCUMENTED = True
 
 
 def validate_mutually_exclusive_handler(*groups):
@@ -118,3 +173,57 @@ def create_client_from_parsed_globals(session, service_name, parsed_globals,
     if overrides:
         client_args.update(overrides)
     return session.create_client(service_name, **client_args)
+
+
+def uni_print(statement, out_file=None):
+    """
+    This function is used to properly write unicode to a file, usually
+    stdout or stdderr.  It ensures that the proper encoding is used if the
+    statement is not a string type.
+    """
+    if out_file is None:
+        out_file = sys.stdout
+    try:
+        # Otherwise we assume that out_file is a
+        # text writer type that accepts str/unicode instead
+        # of bytes.
+        out_file.write(statement)
+    except UnicodeEncodeError:
+        # Some file like objects like cStringIO will
+        # try to decode as ascii on python2.
+        #
+        # This can also fail if our encoding associated
+        # with the text writer cannot encode the unicode
+        # ``statement`` we've been given.  This commonly
+        # happens on windows where we have some S3 key
+        # previously encoded with utf-8 that can't be
+        # encoded using whatever codepage the user has
+        # configured in their console.
+        #
+        # At this point we've already failed to do what's
+        # been requested.  We now try to make a best effort
+        # attempt at printing the statement to the outfile.
+        # We're using 'ascii' as the default because if the
+        # stream doesn't give us any encoding information
+        # we want to pick an encoding that has the highest
+        # chance of printing successfully.
+        new_encoding = getattr(out_file, 'encoding', 'ascii')
+        # When the output of the aws command is being piped,
+        # ``sys.stdout.encoding`` is ``None``.
+        if new_encoding is None:
+            new_encoding = 'ascii'
+        new_statement = statement.encode(
+            new_encoding, 'replace').decode(new_encoding)
+        out_file.write(new_statement)
+    out_file.flush()
+
+
+def get_policy_arn_suffix(region):
+    """Method to return region value as expected by policy arn"""
+    region_string = region.lower()
+    if region_string.startswith("cn-"):
+        return "aws-cn"
+    elif region_string.startswith("us-gov"):
+        return "aws-us-gov"
+    else:
+        return "aws"
