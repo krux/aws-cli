@@ -19,7 +19,8 @@ for performance reasons or to account for the specific environment where these
 Configuration Values
 ====================
 
-These are the configuration values you can set for S3:
+These are the configuration values you can set specifically for the ``aws s3``
+command set:
 
 * ``max_concurrent_requests`` - The maximum number of concurrent requests.
 * ``max_queue_size`` - The maximum number of tasks in the task queue.
@@ -27,6 +28,27 @@ These are the configuration values you can set for S3:
   transfers of individual files.
 * ``multipart_chunksize`` - When using multipart transfers, this is the chunk
   size that the CLI uses for multipart transfers of individual files.
+* ``max_bandwidth`` - The maximum bandwidth that will be consumed for uploading
+  and downloading data to and from Amazon S3.
+
+
+These are the configuration values that can be set for both ``aws s3``
+and ``aws s3api``:
+
+* ``use_accelerate_endpoint`` - Use the Amazon S3 Accelerate endpoint for
+  all ``s3`` and ``s3api`` commands. You **must** first enable S3 Accelerate
+  on your bucket before attempting to use the endpoint. This is mutually
+  exclusive with the ``use_dualstack_endpoint`` option.
+* ``use_dualstack_endpoint`` - Use the Amazon S3 dual IPv4 / IPv6 endpoint for
+  all ``s3 `` and ``s3api`` commands.  This is mutually exclusive with the
+  ``use_accelerate_endpoint`` option.
+* ``addressing_style`` - Specifies which addressing style to use. This controls
+  if the bucket name is in the hostname or part of the URL. Value values are:
+  ``path``, ``virtual``, and ``auto``.  The default value is ``auto``.
+* ``payload_signing_enabled`` - Refers to whether or not to SHA256 sign sigv4
+  payloads. By default, this is disabled for streaming uploads (UploadPart
+  and PutObject) when using https.
+
 
 These values must be set under the top level ``s3`` key in the AWS Config File,
 which has a default location of ``~/.aws/config``.  Below is an example
@@ -40,11 +62,15 @@ configuration::
       max_queue_size = 10000
       multipart_threshold = 64MB
       multipart_chunksize = 16MB
+      max_bandwidth = 50MB/s
+      use_accelerate_endpoint = true
+      addressing_style = path
+
 
 Note that all the S3 configuration values are indented and nested under the top
 level ``s3`` key.
 
-You can also set these values programatically using the ``aws configure set``
+You can also set these values programmatically using the ``aws configure set``
 command.  For example, to set the above values for the default profile, you
 could instead run these commands::
 
@@ -52,6 +78,9 @@ could instead run these commands::
     $ aws configure set default.s3.max_queue_size 10000
     $ aws configure set default.s3.multipart_threshold 64MB
     $ aws configure set default.s3.multipart_chunksize 16MB
+    $ aws configure set default.s3.max_bandwidth 50MB/s
+    $ aws configure set default.s3.use_accelerate_endpoint true
+    $ aws configure set default.s3.addressing_style path
 
 
 max_concurrent_requests
@@ -73,7 +102,8 @@ You may need to change this value for a few reasons:
   requests can overwhelm a system.  This may cause connection timeouts or
   slow the responsiveness of the system.  Lowering this value will make the
   S3 transfer commands less resource intensive.  The tradeoff is that
-  S3 transfers may take longer to complete.
+  S3 transfers may take longer to complete. Lowering this value may be
+  necessary if using a tool such as ``trickle`` to limit bandwidth.
 * Increasing this value - In some scenarios, you may want the S3 transfers
   to complete as quickly as possible, using as much network bandwidth
   as necessary.  In this scenario, the default number of concurrent requests
@@ -128,9 +158,98 @@ multipart_chunksize
 
 **Default** - ``8MB``
 
+**Minimum For Uploads** - ``5MB``
+
 Once the S3 commands have decided to use multipart operations, the
 file is divided into chunks.  This configuration option specifies what
 the chunk size (also referred to as the part size) should be.  This
 value can specified using the same semantics as ``multipart_threshold``,
 that is either as the number of bytes as an integer, or using a size
 suffix.
+
+
+max_bandwidth
+-------------
+
+**Default** - None
+
+This controls the maximum bandwidth that the S3 commands will
+utilize when streaming content data to and from S3. Thus, this value only
+applies for uploads and downloads. It does not apply to copies nor deletes
+because those data transfers take place server side. The value is
+in terms of **bytes** per second. The value can be specified as:
+
+* An integer. For example, ``1048576`` would set the maximum bandwidth usage
+  to 1 megabyte per second.
+* A rate suffix. You can specify rate suffixes using: ``KB/s``, ``MB/s``,
+  ``GB/s``, etc. For example: ``300KB/s``, ``10MB/s``.
+
+In general, it is recommended to first use ``max_concurrent_requests`` to lower
+transfers to the desired bandwidth consumption. The ``max_bandwidth`` setting
+should then be used to further limit bandwidth consumption if setting
+``max_concurrent_requests`` is unable to lower bandwidth consumption to the
+desired rate. This is recommended because ``max_concurrent_requests`` controls
+how many threads are currently running. So if a high ``max_concurrent_requests``
+value is set and a low ``max_bandwidth`` value is set, it may result in
+threads having to wait unneccessarily which can lead to excess resource
+consumption and connection timeouts.
+
+
+use_accelerate_endpoint
+-----------------------
+
+**Default** - ``false``
+
+If set to ``true``, will direct all Amazon S3 requests to the S3 Accelerate
+endpoint: ``s3-accelerate.amazonaws.com``. To use this endpoint, your bucket
+must be enabled to use S3 Accelerate. All request will be sent using the
+virtual style of bucket addressing: ``my-bucket.s3-accelerate.amazonaws.com``.
+Any ``ListBuckets``, ``CreateBucket``, and ``DeleteBucket`` requests will not
+be sent to the Accelerate endpoint as the endpoint does not support those
+operations. This behavior can also be set if ``--endpoint-url`` parameter
+is set to ``https://s3-accelerate.amazonaws.com`` or
+``http://s3-accelerate.amazonaws.com`` for any ``s3`` or ``s3api`` command. This
+option is mutually exclusive with the ``use_dualstack_endpoint`` option.
+
+
+use_dualstack_endpoint
+----------------------
+
+**Default** - ``false``
+
+If set to ``true``, will direct all Amazon S3 requests to the dual IPv4 / IPv6
+endpoint for the configured region. This option is mutually exclusive with
+the ``use_accelerate_endpoint`` option.
+
+
+addressing_style
+----------------
+
+**Default** - ``auto``
+
+There's two styles of constructing an S3 endpoint.  The first is with
+the bucket included as part of the hostname.  This corresponds to the
+addressing style of ``virtual``.  The second is with the bucket included
+as part of the path of the URI, corresponding to the addressing style
+of ``path``.  The default value in the CLI is to use ``auto``, which
+will attempt to use ``virtual`` where possible, but will fall back to
+``path`` style if necessary.  For example, if your bucket name is not
+DNS compatible, the bucket name cannot be part of the hostname and
+must be in the path.  With ``auto``, the CLI will detect this condition
+and automatically switch to ``path`` style for you.  If you set the
+addressing style to ``path``, you must ensure that the AWS region you
+configured in the AWS CLI matches the same region of your bucket.
+
+
+payload_signing_enabled
+-----------------------
+
+If set to ``true``, s3 payloads will receive additional content validation in
+the form of a SHA256 checksum which will be calculated for you and included in
+the request signature. If set to ``false``, the checksum will not be calculated.
+Disabling this can be useful to save the performance overhead that the
+checksum calculation would otherwise cause.
+
+By default, this is disabled for streaming uploads (UploadPart and PutObject),
+but only if a ContentMD5 is present (it is generated by default) and the
+endpoint uses HTTPS.

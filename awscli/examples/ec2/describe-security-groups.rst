@@ -15,15 +15,16 @@ Output::
               "Description": "My security group",
               "IpPermissions": [
                   {
-                      "ToPort": 22,
-                      "IpProtocol": "tcp",
+                      "PrefixListIds": [], 
+                      "FromPort": 22, 
                       "IpRanges": [
                           {
                               "CidrIp": "203.0.113.0/24"
                           }
-                      ],
-                      "UserIdGroupPairs": [],
-                      "FromPort": 22
+                      ], 
+                      "ToPort": 22, 
+                      "IpProtocol": "tcp", 
+                      "UserIdGroupPairs": []
                   }
               ],
               "GroupName": "MySecurityGroup",
@@ -54,22 +55,42 @@ Output::
                               "CidrIp": "0.0.0.0/0"
                           }
                       ],
-                      "UserIdGroupPairs": []
+                      "UserIdGroupPairs": [],
+                      "PrefixListIds": []
                   }
               ],
               "Description": "My security group",
+              "Tags": [
+                  {
+                      "Value": "SG1", 
+                      "Key": "Name"
+                   }
+              ], 
               "IpPermissions": [
                   {
-                      "ToPort": 22,
-                      "IpProtocol": "tcp",
+                      "IpProtocol": "-1", 
+                      "IpRanges": [], 
+                      "UserIdGroupPairs": [
+                          {
+                               "UserId": "123456789012", 
+                               "GroupId": "sg-903004f8"
+                          }
+                      ], 
+                      "PrefixListIds": []
+                  },
+                  {
+                      "PrefixListIds": [], 
+                      "FromPort": 22, 
                       "IpRanges": [
                           {
+                              "Description": "Access from NY office",
                               "CidrIp": "203.0.113.0/24"
                           }
-                      ],
-                      "UserIdGroupPairs": [],
-                      "FromPort": 22
-                  }
+                      ], 
+                      "ToPort": 22, 
+                      "IpProtocol": "tcp", 
+                      "UserIdGroupPairs": []
+                    }
               ],
               "GroupName": "MySecurityGroup",
               "VpcId": "vpc-1a2b3c4d",
@@ -85,7 +106,7 @@ Output::
 
 Command::
 
-  aws ec2 describe-security-groups --filters Name=ip-permission.from-port,Values=22 Name=ip-permission.to-port,Values=22 Name=ip-permission.cidr,Values='0.0.0.0/0' --query 'SecurityGroups[*].{Name:GroupName}'
+  aws ec2 describe-security-groups --filters Name=ip-permission.from-port,Values=22 Name=ip-permission.to-port,Values=22 Name=ip-permission.cidr,Values='0.0.0.0/0' --query "SecurityGroups[*].{Name:GroupName}"
 
 Output::
 
@@ -107,7 +128,7 @@ This example describes all security groups that include ``test`` in the security
 
 Command::
 
-  aws ec2 describe-security-groups --filters Name=group-name,Values='*test*' Name=tag-key,Values=Test Name=tag-value,Values=To-delete --query 'SecurityGroups[*].{Name:GroupName,ID:GroupId}'
+  aws ec2 describe-security-groups --filters Name=group-name,Values=*test* Name=tag:Test,Values=To-delete --query "SecurityGroups[*].{Name:GroupName,ID:GroupId}"
   
 Output::
 

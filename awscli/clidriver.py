@@ -21,10 +21,14 @@ from botocore import xform_name
 from botocore.compat import copy_kwargs, OrderedDict
 from botocore.exceptions import NoCredentialsError
 from botocore.exceptions import NoRegionError
+from botocore.history import get_global_history_recorder
 
 from awscli import EnvironmentVariables, __version__
+from awscli.compat import get_stderr_text_writer
 from awscli.formatter import get_formatter
 from awscli.plugin import load_plugins
+from awscli.commands import CLICommand
+from awscli.compat import six
 from awscli.argparser import MainArgParser
 from awscli.argparser import ServiceArgParser
 from awscli.argparser import ArgTableArgParser
@@ -38,24 +42,30 @@ from awscli.arguments import BooleanArgument
 from awscli.arguments import CLIArgument
 from awscli.arguments import UnknownArgumentError
 from awscli.argprocess import unpack_argument
+from awscli.alias import AliasLoader
+from awscli.alias import AliasCommandInjector
+from awscli.utils import emit_top_level_args_parsed_event
+from awscli.utils import write_exception
 
 
 LOG = logging.getLogger('awscli.clidriver')
 LOG_FORMAT = (
     '%(asctime)s - %(threadName)s - %(name)s - %(levelname)s - %(message)s')
+HISTORY_RECORDER = get_global_history_recorder()
 
 
 def main():
     driver = create_clidriver()
-    return driver.main()
+    rc = driver.main()
+    HISTORY_RECORDER.record('CLI_RC', rc, 'CLI')
+    return rc
 
 
 def create_clidriver():
-    emitter = HierarchicalEmitter()
-    session = botocore.session.Session(EnvironmentVariables, emitter)
+    session = botocore.session.Session(EnvironmentVariables)
     _set_user_agent_for_session(session)
     load_plugins(session.full_config.get('plugins', {}),
-                 event_hooks=emitter)
+                 event_hooks=session.get_component('event_emitter'))
     driver = CLIDriver(session=session)
     return driver
 
@@ -77,6 +87,7 @@ class CLIDriver(object):
         self._cli_data = None
         self._command_table = None
         self._argument_table = None
+        self.alias_loader = AliasLoader()
 
     def _get_cli_data(self):
         # Not crazy about this but the data in here is needed in
@@ -120,6 +131,12 @@ class CLIDriver(object):
                                                     service_name=service_name)
         return commands
 
+    def _add_aliases(self, command_table, parser):
+        parser = self._create_parser(command_table)
+        injector = AliasCommandInjector(
+            self.session, self.alias_loader)
+        injector.inject_aliases(command_table, parser)
+
     def _build_argument_table(self):
         argument_table = OrderedDict()
         cli_data = self._get_cli_data()
@@ -152,15 +169,15 @@ class CLIDriver(object):
                                    cli_data.get('synopsis', None),
                                    cli_data.get('help_usage', None))
 
-    def _create_parser(self):
+    def _create_parser(self, command_table):
         # Also add a 'help' command.
-        command_table = self._get_command_table()
         command_table['help'] = self.create_help_command()
         cli_data = self._get_cli_data()
         parser = MainArgParser(
             command_table, self.session.user_agent(),
             cli_data.get('description', None),
-            self._get_argument_table())
+            self._get_argument_table(),
+            prog="aws")
         return parser
 
     def main(self, args=None):
@@ -173,8 +190,9 @@ class CLIDriver(object):
         """
         if args is None:
             args = sys.argv[1:]
-        parser = self._create_parser()
         command_table = self._get_command_table()
+        parser = self._create_parser(command_table)
+        self._add_aliases(command_table, parser)
         parsed_args, remaining = parser.parse_known_args(args)
         try:
             # Because _handle_top_level_args emits events, it's possible
@@ -182,7 +200,10 @@ class CLIDriver(object):
             # general exception handling logic as calling into the
             # command table.  This is why it's in the try/except clause.
             self._handle_top_level_args(parsed_args)
-            self._emit_session_event()
+            self._emit_session_event(parsed_args)
+            HISTORY_RECORDER.record(
+                'CLI_VERSION', self.session.user_agent(), 'CLI')
+            HISTORY_RECORDER.record('CLI_ARGUMENTS', args, 'CLI')
             return command_table[parsed_args.command](remaining, parsed_args)
         except UnknownArgumentError as e:
             sys.stderr.write("usage: %s\n" % USAGE)
@@ -208,17 +229,18 @@ class CLIDriver(object):
         except Exception as e:
             LOG.debug("Exception caught in main()", exc_info=True)
             LOG.debug("Exiting with rc 255")
-            sys.stderr.write("\n")
-            sys.stderr.write("%s\n" % e)
+            write_exception(e, outfile=get_stderr_text_writer())
             return 255
 
-    def _emit_session_event(self):
+    def _emit_session_event(self, parsed_args):
         # This event is guaranteed to run after the session has been
         # initialized and a profile has been set.  This was previously
         # problematic because if something in CLIDriver caused the
         # session components to be reset (such as session.profile = foo)
         # then all the prior registered components would be removed.
-        self.session.emit('session-initialized', session=self.session)
+        self.session.emit(
+            'session-initialized', session=self.session,
+            parsed_args=parsed_args)
 
     def _show_error(self, msg):
         LOG.debug(msg, exc_info=True)
@@ -226,8 +248,7 @@ class CLIDriver(object):
         sys.stderr.write('\n')
 
     def _handle_top_level_args(self, args):
-        self.session.emit(
-            'top-level-args-parsed', parsed_args=args, session=self.session)
+        emit_top_level_args_parsed_event(self.session, args)
         if args.profile:
             self.session.set_config_variable('profile', args.profile)
         if args.debug:
@@ -239,70 +260,14 @@ class CLIDriver(object):
                                            format_string=LOG_FORMAT)
             self.session.set_stream_logger('awscli', logging.DEBUG,
                                            format_string=LOG_FORMAT)
+            self.session.set_stream_logger('s3transfer', logging.DEBUG,
+                                           format_string=LOG_FORMAT)
             LOG.debug("CLI version: %s", self.session.user_agent())
             LOG.debug("Arguments entered to CLI: %s", sys.argv[1:])
 
         else:
             self.session.set_stream_logger(logger_name='awscli',
                                            log_level=logging.ERROR)
-
-
-class CLICommand(object):
-
-    """Interface for a CLI command.
-
-    This class represents a top level CLI command
-    (``aws ec2``, ``aws s3``, ``aws config``).
-
-    """
-
-    @property
-    def name(self):
-        # Subclasses must implement a name.
-        raise NotImplementedError("name")
-
-    @name.setter
-    def name(self, value):
-        # Subclasses must implement setting/changing the cmd name.
-        raise NotImplementedError("name")
-
-    @property
-    def lineage(self):
-        # Represents how to get to a specific command using the CLI.
-        # It includes all commands that came before it and itself in
-        # a list.
-        return [self]
-
-    @property
-    def lineage_names(self):
-        # Represents the lineage of a command in terms of command ``name``
-        return [cmd.name for cmd in self.lineage]
-
-    def __call__(self, args, parsed_globals):
-        """Invoke CLI operation.
-
-        :type args: str
-        :param args: The remaining command line args.
-
-        :type parsed_globals: ``argparse.Namespace``
-        :param parsed_globals: The parsed arguments so far.
-
-        :rtype: int
-        :return: The return code of the operation.  This will be used
-            as the RC code for the ``aws`` process.
-
-        """
-        # Subclasses are expected to implement this method.
-        pass
-
-    def create_help_command(self):
-        # Subclasses are expected to implement this method if they want
-        # help docs.
-        return None
-
-    @property
-    def arg_table(self):
-        return {}
 
 
 class ServiceCommand(CLICommand):
@@ -363,8 +328,10 @@ class ServiceCommand(CLICommand):
 
     def _get_service_model(self):
         if self._service_model is None:
+            api_version = self.session.get_config_variable('api_versions').get(
+                self._service_name, None)
             self._service_model = self.session.get_service_model(
-                self._service_name)
+                self._service_name, api_version=api_version)
         return self._service_model
 
     def __call__(self, args, parsed_globals):
@@ -464,6 +431,8 @@ class ServiceOperation(object):
         self._lineage = [self]
         self._operation_model = operation_model
         self._session = session
+        if operation_model.deprecated:
+            self._UNDOCUMENTED = True
 
     @property
     def name(self):
@@ -514,8 +483,9 @@ class ServiceOperation(object):
                                                  self._name)
         self._emit(event, parsed_args=parsed_args,
                    parsed_globals=parsed_globals)
-        call_parameters = self._build_call_parameters(parsed_args,
-                                                      self.arg_table)
+        call_parameters = self._build_call_parameters(
+            parsed_args, self.arg_table)
+
         event = 'calling-command.%s.%s' % (self._parent_name,
                                            self._name)
         override = self._emit_first_non_none_response(
@@ -595,7 +565,8 @@ class ServiceOperation(object):
             cli_arg_name = xform_name(arg_name, '-')
             arg_class = self.ARG_TYPES.get(arg_shape.type_name,
                                            self.DEFAULT_ARG_CLASS)
-            is_required = arg_name in required_arguments
+            is_token = arg_shape.metadata.get('idempotencyToken', False)
+            is_required = arg_name in required_arguments and not is_token
             event_emitter = self._session.get_component('event_emitter')
             arg_object = arg_class(
                 name=cli_arg_name,
@@ -661,6 +632,13 @@ class CLIOperationCaller(object):
             service_name, region_name=parsed_globals.region,
             endpoint_url=parsed_globals.endpoint_url,
             verify=parsed_globals.verify_ssl)
+        response = self._make_client_call(
+            client, operation_name, parameters, parsed_globals)
+        self._display_response(operation_name, response, parsed_globals)
+        return 0
+
+    def _make_client_call(self, client, operation_name, parameters,
+                          parsed_globals):
         py_operation_name = xform_name(operation_name)
         if client.can_paginate(py_operation_name) and parsed_globals.paginate:
             paginator = client.get_paginator(py_operation_name)
@@ -668,8 +646,7 @@ class CLIOperationCaller(object):
         else:
             response = getattr(client, xform_name(operation_name))(
                 **parameters)
-        self._display_response(operation_name, response, parsed_globals)
-        return 0
+        return response
 
     def _display_response(self, command_name, response,
                           parsed_globals):

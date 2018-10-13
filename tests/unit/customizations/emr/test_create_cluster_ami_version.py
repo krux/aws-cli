@@ -13,11 +13,14 @@
 
 from tests.unit.customizations.emr import EMRBaseAWSCommandParamsTest as \
     BaseAWSCommandParamsTest
+from tests.unit.customizations.emr import test_constants as \
+    CONSTANTS
+from tests.unit.customizations.emr import test_constants_instance_fleets as \
+    CONSTANTS_FLEET
 import copy
 import os
 import json
 from mock import patch
-from botocore.vendored import requests
 
 
 DEFAULT_CLUSTER_NAME = "Development Cluster"
@@ -711,6 +714,35 @@ class TestCreateCluster(BaseAWSCommandParamsTest):
         ]
         self.assert_params_for_cmd(cmd, result)
 
+    def test_instance_groups_from_json_file_spot_bidprice_equals_ondemandprice(self):
+        data_path = os.path.join(
+            os.path.dirname(__file__), 'input_instance_groups_spot_bidprice_equals_ondemandprice.json')
+        cmd = ('emr create-cluster --use-default-roles --ami-version 3.0.4  '
+               '--instance-groups file://' + data_path)
+        result = copy.deepcopy(DEFAULT_RESULT)
+        result['Instances']['InstanceGroups'] = \
+            [
+                {'InstanceRole': 'MASTER',
+                 'InstanceCount': 1,
+                 'Name': 'Master Instance Group',
+                 'Market': 'SPOT',
+                 'InstanceType': 'm1.large'
+                 },
+                {'InstanceRole': 'CORE',
+                 'InstanceCount': 2,
+                 'Name': 'Core Instance Group',
+                 'Market': 'SPOT',
+                 'InstanceType': 'm1.xlarge'
+                 },
+                {'InstanceRole': 'TASK',
+                 'InstanceCount': 3,
+                 'Name': 'Task Instance Group',
+                 'Market': 'SPOT',
+                 'InstanceType': 'm1.xlarge'
+                 }
+        ]
+        self.assert_params_for_cmd(cmd, result)
+
     def test_ec2_attributes_no_az(self):
         cmd = ('emr create-cluster --ami-version 3.0.4 '
                '--instance-groups ' + DEFAULT_INSTANCE_GROUPS_ARG +
@@ -890,7 +922,7 @@ class TestCreateCluster(BaseAWSCommandParamsTest):
         result = copy.deepcopy(DEFAULT_RESULT)
         ba = copy.deepcopy(INSTALL_IMPALA_BA)
         ba['ScriptBootstrapAction']['Args'] += \
-            ['--impala-conf', 'arg1', 'arg2']
+            ['--impala-conf', 'arg1,arg2']
         result['BootstrapActions'] = [ba]
         self.assert_params_for_cmd(cmd, result)
 
@@ -950,7 +982,7 @@ class TestCreateCluster(BaseAWSCommandParamsTest):
         impala_ba = copy.deepcopy(INSTALL_IMPALA_BA)
         impala_ba['ScriptBootstrapAction']['Args'] += \
             ['--impala-conf',
-             'IMPALA_BACKEND_PORT=22001', 'IMPALA_MEM_LIMIT=70%']
+             'IMPALA_BACKEND_PORT=22001,IMPALA_MEM_LIMIT=70%']
         ba_list = [INSTALL_GANGLIA_BA, INSTALL_HBASE_BA,
                    impala_ba]
         step_list = [INSTALL_HIVE_STEP, INSTALL_PIG_STEP, INSTALL_HBASE_STEP]
@@ -1304,6 +1336,300 @@ class TestCreateCluster(BaseAWSCommandParamsTest):
             ADDITIONAL_SLAVE_SECURITY_GROUPS
 
         self.assert_params_for_cmd(cmd, result)
+
+    def test_instance_group_with_autoscaling_policy(self):
+        cmd = (self.prefix + '--ami-version 3.1.0 --auto-scaling-role EMR_AUTOSCALING_ROLE --instance-groups ' +
+               CONSTANTS.INSTANCE_GROUPS_WITH_AUTOSCALING_POLICY_ARG)
+        result = \
+            {
+                'Name': DEFAULT_CLUSTER_NAME,
+                'Instances': {'KeepJobFlowAliveWhenNoSteps': True,
+                              'TerminationProtected': False,
+                              'InstanceGroups': CONSTANTS.INSTANCE_GROUPS_WITH_AUTOSCALING_POLICY
+                              },
+                'AmiVersion': '3.1.0',
+                'AutoScalingRole': 'EMR_AUTOSCALING_ROLE',
+                'VisibleToAllUsers': True,
+                'Tags': []
+            }
+        self.assert_params_for_cmd(cmd, result)
+
+    def test_instance_group_with_autoscaling_policy_missing_autoscaling_role(self):
+        cmd = (self.prefix + '--ami-version 3.1.0 --instance-groups ' +
+               CONSTANTS.INSTANCE_GROUPS_WITH_AUTOSCALING_POLICY_ARG)
+        expected_error_msg = (
+            '\naws: error: Must specify --auto-scaling-role when'
+            ' configuring an AutoScaling policy for an instance group.\n')
+        result = self.run_cmd(cmd, 255)
+        self.assertEquals(expected_error_msg, result[1])
+
+    def test_scale_down_behavior(self):
+        cmd = (self.prefix + '--ami-version 3.1.0 --scale-down-behavior TERMINATE_AT_TASK_COMPLETION '
+                             '--instance-groups ' + DEFAULT_INSTANCE_GROUPS_ARG)
+        result = \
+            {
+                'Name': DEFAULT_CLUSTER_NAME,
+                'Instances': DEFAULT_INSTANCES,
+                'AmiVersion': '3.1.0',
+                'VisibleToAllUsers': True,
+                'ScaleDownBehavior': 'TERMINATE_AT_TASK_COMPLETION',
+                'Tags': []
+            }
+        self.assert_params_for_cmd(cmd, result)
+
+    def test_instance_group_with_ebs_config(self):
+        cmd = (self.prefix + '--ami-version 3.1.0 --instance-groups ' +
+               CONSTANTS.INSTANCE_GROUPS_WITH_EBS_VOLUME_ARG)
+        result = \
+            {
+                'Name': DEFAULT_CLUSTER_NAME,
+                'Instances': {'KeepJobFlowAliveWhenNoSteps': True,
+                              'TerminationProtected': False,
+                              'InstanceGroups':
+                                                CONSTANTS.INSTANCE_GROUPS_WITH_EBS
+                            },
+                'AmiVersion': '3.1.0',
+                'VisibleToAllUsers': True,
+                'Tags': []
+            }
+        self.assert_params_for_cmd(cmd, result)
+
+    def test_instance_groups_with_ebs_config_missing_volume_type(self):
+        cmd = (self.prefix + '--ami-version 3.1.0 --instance-groups ' +
+               CONSTANTS.INSTANCE_GROUPS_WITH_EBS_VOLUME_MISSING_VOLTYPE_ARG)
+        stderr = self.run_cmd(cmd, 255)[1]
+        self.assert_error_message_has_field_name(stderr, 'VolumeType')
+
+    def test_instance_groups_with_ebs_config_missing_size(self):
+        cmd = (self.prefix + '--ami-version 3.1.0 --instance-groups ' +
+               CONSTANTS.INSTANCE_GROUPS_WITH_EBS_VOLUME_MISSING_SIZE_ARG)
+        stderr = self.run_cmd(cmd, 255)[1]
+        self.assert_error_message_has_field_name(stderr, 'SizeInGB')
+
+    def test_instance_groups_with_ebs_config_missing_volume_spec(self):
+        cmd = (self.prefix + '--ami-version 3.1.0 --instance-groups ' +
+               CONSTANTS.INSTANCE_GROUPS_WITH_EBS_VOLUME_MISSING_VOLSPEC_ARG)
+        result = \
+            {
+                'Name': DEFAULT_CLUSTER_NAME,
+                'Instances': {'KeepJobFlowAliveWhenNoSteps': True,
+                              'TerminationProtected': False,
+                              'InstanceGroups': CONSTANTS.INSTANCE_GROUPS_WITH_EBS_VOLUME_MISSING_VOLSPEC
+                                      },
+                'AmiVersion': '3.1.0',
+                'VisibleToAllUsers': True,
+                'Tags': []
+            }
+        self.assert_params_for_cmd(cmd, result)
+
+    def test_instance_groups_with_ebs_config_missing_iops(self):
+        cmd = (self.prefix + '--ami-version 3.1.0 --instance-groups ' +
+               CONSTANTS.INSTANCE_GROUPS_WITH_EBS_VOLUME_MISSING_IOPS_ARG)
+        result = \
+            {
+                'Name': DEFAULT_CLUSTER_NAME,
+                'Instances': {'KeepJobFlowAliveWhenNoSteps': True,
+                              'TerminationProtected': False,
+                              'InstanceGroups': CONSTANTS.INSTANCE_GROUPS_WITH_EBS_VOLUME_MISSING_IOPS
+                             },
+                'AmiVersion': '3.1.0',
+                'VisibleToAllUsers': True,
+                'Tags': []
+            }
+        self.assert_params_for_cmd(cmd, result)
+
+    def test_instance_groups_with_ebs_config_multiple_instance_groups(self):
+        cmd = (self.prefix + '--ami-version 3.1.0 --instance-groups ' +
+               CONSTANTS.MULTIPLE_INSTANCE_GROUPS_WITH_EBS_VOLUMES_VOLUME_ARG)
+        result = \
+            {
+                'Name': DEFAULT_CLUSTER_NAME,
+                'Instances': {'KeepJobFlowAliveWhenNoSteps': True,
+                              'TerminationProtected': False,
+                              'InstanceGroups': CONSTANTS.MULTIPLE_INSTANCE_GROUPS_WITH_EBS_VOLUMES
+                             },
+                'AmiVersion': '3.1.0',
+                'VisibleToAllUsers': True,
+                'Tags': []
+            }
+        self.assert_params_for_cmd(cmd, result)
+
+    def test_instance_group_with_ebs_config_from_json(self):
+           data_path = os.path.join(
+               os.path.dirname(__file__), 'input_instance_groups_ebs_config.json')
+           cmd = ('emr create-cluster --use-default-roles --ami-version 3.0.4  '
+                  '--instance-groups file://' + data_path)
+           result = copy.deepcopy(DEFAULT_RESULT)
+           result['Instances']['InstanceGroups'] = \
+               [
+                   {'InstanceRole': 'MASTER',
+                    'InstanceCount': 1,
+                    'Name': 'Master Instance Group',
+                    'Market': 'ON_DEMAND',
+                    'InstanceType': 'd2.xlarge',
+                    'EbsConfiguration':
+                   {'EbsBlockDeviceConfigs':
+                         [
+                           {'VolumeSpecification':
+                            {'VolumeType': 'standard',
+                            'SizeInGB': 10},
+                            'VolumesPerInstance': 4
+                            }
+                         ],
+                        'EbsOptimized': True}
+                    },
+                   {'InstanceRole': 'CORE',
+                    'InstanceCount': 2,
+                    'Name': 'Core Instance Group',
+                    'Market': 'ON_DEMAND',
+                    'InstanceType': 'd2.xlarge'
+                    },
+                   {'InstanceRole': 'TASK',
+                    'InstanceCount': 3,
+                    'Name': 'Task Instance Group',
+                    'Market': 'SPOT',
+                    'BidPrice': '3.45',
+                    'InstanceType': 'd2.xlarge'
+                    }
+           ]
+           self.assert_params_for_cmd(cmd, result)
+
+    def test_instance_fleets_with_on_demand_master_only(self):
+        cmd = (self.prefix + '--ami-version 3.1.0 --instance-fleets ' +
+               CONSTANTS_FLEET.INSTANCE_FLEETS_WITH_ON_DEMAND_MASTER_ONLY)
+        result = \
+            {
+                'Name': DEFAULT_CLUSTER_NAME,
+                'Instances': {'KeepJobFlowAliveWhenNoSteps': True,
+                              'TerminationProtected': False,
+                              'InstanceFleets':
+                                                CONSTANTS_FLEET.RES_INSTANCE_FLEETS_WITH_ON_DEMAND_MASTER_ONLY
+                            },
+                'AmiVersion': '3.1.0',
+                'VisibleToAllUsers': True,
+                'Tags': []
+            }
+        self.assert_params_for_cmd(cmd, result)
+
+    def test_instance_fleets_with_spot_master_only(self):
+        cmd = (self.prefix + '--ami-version 3.1.0 --instance-fleets ' +
+               CONSTANTS_FLEET.INSTANCE_FLEETS_WITH_SPOT_MASTER_ONLY)
+        result = \
+            {
+                'Name': DEFAULT_CLUSTER_NAME,
+                'Instances': {'KeepJobFlowAliveWhenNoSteps': True,
+                              'TerminationProtected': False,
+                              'InstanceFleets':
+                                                CONSTANTS_FLEET.RES_INSTANCE_FLEETS_WITH_SPOT_MASTER_ONLY
+                            },
+                'AmiVersion': '3.1.0',
+                'VisibleToAllUsers': True,
+                'Tags': []
+            }
+        self.assert_params_for_cmd(cmd, result)
+
+    def test_instance_fleets_with_spot_master_only_with_ebs_conf(self):
+        cmd = (self.prefix + '--ami-version 3.1.0 --instance-fleets ' +
+               CONSTANTS_FLEET.INSTANCE_FLEETS_WITH_SPOT_MASTER_ONLY_WITH_EBS_CONF)
+        result = \
+            {
+                'Name': DEFAULT_CLUSTER_NAME,
+                'Instances': {'KeepJobFlowAliveWhenNoSteps': True,
+                              'TerminationProtected': False,
+                              'InstanceFleets':
+                                                CONSTANTS_FLEET.RES_INSTANCE_FLEETS_WITH_SPOT_MASTER_ONLY_WITH_EBS_CONF
+                            },
+                'AmiVersion': '3.1.0',
+                'VisibleToAllUsers': True,
+                'Tags': []
+            }
+        self.assert_params_for_cmd(cmd, result)
+
+    def test_instance_fleets_with_spot_master_specific_azs(self):
+        cmd = (self.prefix + '--ami-version 3.1.0 --instance-fleets ' +
+               CONSTANTS_FLEET.INSTANCE_FLEETS_WITH_SPOT_MASTER_ONLY +
+               ' --ec2-attributes AvailabilityZones=[us-east-1a,us-east-1b]')
+        result = \
+            {
+                'Name': DEFAULT_CLUSTER_NAME,
+                'Instances': {'KeepJobFlowAliveWhenNoSteps': True,
+                              'TerminationProtected': False,
+                              'InstanceFleets':
+                                                CONSTANTS_FLEET.RES_INSTANCE_FLEETS_WITH_SPOT_MASTER_ONLY,
+                              'Placement': {'AvailabilityZones': ['us-east-1a','us-east-1b']}
+                            },
+                'AmiVersion': '3.1.0',
+                'VisibleToAllUsers': True,
+                'Tags': []
+            }
+        self.assert_params_for_cmd(cmd, result)
+
+    def test_instance_fleets_with_spot_master_subnet_ids(self):
+        cmd = (self.prefix + '--ami-version 3.1.0 --instance-fleets ' +
+               CONSTANTS_FLEET.INSTANCE_FLEETS_WITH_SPOT_MASTER_ONLY +
+               ' --ec2-attributes SubnetIds=[subnetid-1,subnetid-2]')
+        result = \
+            {
+                'Name': DEFAULT_CLUSTER_NAME,
+                'Instances': {'KeepJobFlowAliveWhenNoSteps': True,
+                              'TerminationProtected': False,
+                              'InstanceFleets':
+                                                CONSTANTS_FLEET.RES_INSTANCE_FLEETS_WITH_SPOT_MASTER_ONLY,
+                              'Ec2SubnetIds': ['subnetid-1','subnetid-2']
+                            },
+                'AmiVersion': '3.1.0',
+                'VisibleToAllUsers': True,
+                'Tags': []
+            }
+        self.assert_params_for_cmd(cmd, result)
+
+    def test_instance_fleets_with_spot_master_core_cluster_multiple_instance_types(self):
+        cmd = (self.prefix + '--ami-version 3.1.0 --instance-fleets ' +
+               CONSTANTS_FLEET.INSTANCE_FLEETS_WITH_SPOT_MASTER_CORE_CLUSTER)
+        result = \
+            {
+                'Name': DEFAULT_CLUSTER_NAME,
+                'Instances': {'KeepJobFlowAliveWhenNoSteps': True,
+                              'TerminationProtected': False,
+                              'InstanceFleets':
+                                                CONSTANTS_FLEET.RES_INSTANCE_FLEETS_WITH_SPOT_MASTER_CORE_CLUSTER
+                            },
+                'AmiVersion': '3.1.0',
+                'VisibleToAllUsers': True,
+                'Tags': []
+            }
+        self.assert_params_for_cmd(cmd, result)
+
+    def test_instance_fleets_with_complex_config_from_json(self):
+        data_path = os.path.join(
+            os.path.dirname(__file__), 'input_instance_fleets.json')
+        cmd = ('emr create-cluster --use-default-roles --ami-version 3.1.0  '
+                '--instance-fleets file://' + data_path)
+        result = \
+            {
+                'Name': DEFAULT_CLUSTER_NAME,
+                'Instances': {'KeepJobFlowAliveWhenNoSteps': True,
+                              'TerminationProtected': False,
+                              'InstanceFleets':
+                                                CONSTANTS_FLEET.RES_INSTANCE_FLEETS_WITH_COMPLEX_CONFIG_FROM_JSON
+                            },
+                'AmiVersion': '3.1.0',
+                'VisibleToAllUsers': True,
+                'Tags': [],
+                'JobFlowRole': 'EMR_EC2_DefaultRole',
+                'ServiceRole': 'EMR_DefaultRole'
+            }
+        self.assert_params_for_cmd(cmd, result)
+
+    def test_instance_fleets_with_both_az_azs_specified(self):
+        cmd = (self.prefix + '--ami-version 3.1.0 --instance-fleets ' +
+               CONSTANTS_FLEET.INSTANCE_FLEETS_WITH_SPOT_MASTER_ONLY +
+               ' --ec2-attributes AvailabilityZone=us-east-1a,AvailabilityZones=[us-east-1a,us-east-1b]')
+        expected_error_msg = (
+            '\naws: error: You cannot specify both AvailabilityZone'
+            ' and AvailabilityZones options together.\n')
+        result = self.run_cmd(cmd, 255)
+        self.assertEquals(expected_error_msg, result[1])
 
 if __name__ == "__main__":
     unittest.main()

@@ -23,6 +23,7 @@ from awscli.customizations.emr import exceptions
 from awscli.customizations.emr import hbaseutils
 from awscli.customizations.emr import helptext
 from awscli.customizations.emr import instancegroupsutils
+from awscli.customizations.emr import instancefleetsutils
 from awscli.customizations.emr import steputils
 from awscli.customizations.emr.command import Command
 from awscli.customizations.emr.constants import EC2_ROLE_NAME
@@ -50,6 +51,9 @@ class CreateCluster(Command):
          'help_text': helptext.AUTO_TERMINATE},
         {'name': 'no-auto-terminate', 'action': 'store_true',
          'group_name': 'auto_terminate'},
+        {'name': 'instance-fleets',
+         'schema': argumentschema.INSTANCE_FLEETS_SCHEMA,
+         'help_text': helptext.INSTANCE_FLEETS},
         {'name': 'name',
          'default': 'Development Cluster',
          'help_text': helptext.CLUSTER_NAME},
@@ -57,6 +61,8 @@ class CreateCluster(Command):
          'help_text': helptext.LOG_URI},
         {'name': 'service-role',
          'help_text': helptext.SERVICE_ROLE},
+        {'name': 'auto-scaling-role',
+         'help_text': helptext.AUTOSCALING_ROLE},
         {'name': 'use-default-roles', 'action': 'store_true',
          'help_text': helptext.USE_DEFAULT_ROLES},
         {'name': 'configurations',
@@ -69,6 +75,8 @@ class CreateCluster(Command):
          'help_text': helptext.TERMINATION_PROTECTED},
         {'name': 'no-termination-protected', 'action': 'store_true',
          'group_name': 'termination_protected'},
+        {'name': 'scale-down-behavior',
+         'help_text': helptext.SCALE_DOWN_BEHAVIOR},
         {'name': 'visible-to-all-users', 'action': 'store_true',
          'group_name': 'visibility',
          'help_text': helptext.VISIBILITY},
@@ -98,7 +106,18 @@ class CreateCluster(Command):
          'help_text': helptext.ADDITIONAL_INFO},
         {'name': 'restore-from-hbase-backup',
          'schema': argumentschema.HBASE_RESTORE_FROM_BACKUP_SCHEMA,
-         'help_text': helptext.RESTORE_FROM_HBASE}
+         'help_text': helptext.RESTORE_FROM_HBASE},
+        {'name': 'security-configuration',
+         'help_text': helptext.SECURITY_CONFIG},
+        {'name': 'custom-ami-id',
+         'help_text' : helptext.CUSTOM_AMI_ID},
+        {'name': 'ebs-root-volume-size',
+         'help_text' : helptext.EBS_ROOT_VOLUME_SIZE},
+        {'name': 'repo-upgrade-on-boot',
+         'help_text' : helptext.REPO_UPGRADE_ON_BOOT},
+        {'name': 'kerberos-attributes',
+         'schema': argumentschema.KERBEROS_ATTRIBUTES_SCHEMA,
+         'help_text': helptext.KERBEROS_ATTRIBUTES}
     ]
     SYNOPSIS = BasicCommand.FROM_FILE('emr', 'create-cluster-synopsis.rst')
     EXAMPLES = BasicCommand.FROM_FILE('emr', 'create-cluster-examples.rst')
@@ -128,12 +147,23 @@ class CreateCluster(Command):
                 option2="--ec2-attributes InstanceProfile",
                 message=service_role_validation_message)
 
+        if parsed_args.instance_groups is not None and \
+                parsed_args.instance_fleets is not None:
+            raise exceptions.MutualExclusiveOptionError(
+                option1="--instance-groups",
+                option2="--instance-fleets")
+
         instances_config = {}
-        instances_config['InstanceGroups'] = \
-            instancegroupsutils.validate_and_build_instance_groups(
-                instance_groups=parsed_args.instance_groups,
-                instance_type=parsed_args.instance_type,
-                instance_count=parsed_args.instance_count)
+        if parsed_args.instance_fleets is not None:
+            instances_config['InstanceFleets'] = \
+                instancefleetsutils.validate_and_build_instance_fleets(
+                    parsed_args.instance_fleets)
+        else:
+            instances_config['InstanceGroups'] = \
+                instancegroupsutils.validate_and_build_instance_groups(
+                    instance_groups=parsed_args.instance_groups,
+                    instance_type=parsed_args.instance_type,
+                    instance_count=parsed_args.instance_count)
 
         if parsed_args.release_label is not None:
             params["ReleaseLabel"] = parsed_args.release_label
@@ -163,6 +193,17 @@ class CreateCluster(Command):
             parsed_args.ec2_attributes['InstanceProfile'] = EC2_ROLE_NAME
 
         emrutils.apply_dict(params, 'ServiceRole', parsed_args.service_role)
+
+        if parsed_args.instance_groups is not None:
+            for instance_group in instances_config['InstanceGroups']:
+                if 'AutoScalingPolicy' in instance_group.keys():
+                    if parsed_args.auto_scaling_role is None:
+                        raise exceptions.MissingAutoScalingRoleError()
+
+        emrutils.apply_dict(params, 'AutoScalingRole', parsed_args.auto_scaling_role)
+
+        if parsed_args.scale_down_behavior is not None:
+            emrutils.apply_dict(params, 'ScaleDownBehavior', parsed_args.scale_down_behavior)
 
         if (
                 parsed_args.no_auto_terminate is False and
@@ -267,6 +308,28 @@ class CreateCluster(Command):
             self._update_cluster_dict(
                 cluster=params, key='Steps', value=steps_list)
 
+        if parsed_args.security_configuration is not None:
+            emrutils.apply_dict(
+                params, 'SecurityConfiguration', parsed_args.security_configuration)
+
+        if parsed_args.custom_ami_id is not None:
+            emrutils.apply_dict(
+                params, 'CustomAmiId', parsed_args.custom_ami_id
+            )
+        if parsed_args.ebs_root_volume_size is not None:
+            emrutils.apply_dict(
+                params, 'EbsRootVolumeSize', int(parsed_args.ebs_root_volume_size)
+            )
+
+        if parsed_args.repo_upgrade_on_boot is not None:
+            emrutils.apply_dict(
+                params, 'RepoUpgradeOnBoot', parsed_args.repo_upgrade_on_boot
+            )
+
+        if parsed_args.kerberos_attributes is not None:
+            emrutils.apply_dict(
+                params, 'KerberosAttributes', parsed_args.kerberos_attributes)
+
         self._validate_required_applications(parsed_args)
 
         run_job_flow_response = emrutils.call(
@@ -292,7 +355,19 @@ class CreateCluster(Command):
     def _build_ec2_attributes(self, cluster, parsed_attrs):
         keys = parsed_attrs.keys()
         instances = cluster['Instances']
-        if 'AvailabilityZone' in keys and 'SubnetId' in keys:
+
+        if ('SubnetId' in keys and 'SubnetIds' in keys):
+            raise exceptions.MutualExclusiveOptionError(
+                option1="SubnetId",
+                option2="SubnetIds")
+
+        if ('AvailabilityZone' in keys and 'AvailabilityZones' in keys):
+            raise exceptions.MutualExclusiveOptionError(
+                option1="AvailabilityZone",
+                option2="AvailabilityZones")
+
+        if ('SubnetId' in keys or 'SubnetIds' in keys) \
+                and ('AvailabilityZone' in keys or 'AvailabilityZones' in keys):
             raise exceptions.SubnetAndAzValidationError
 
         emrutils.apply_params(
@@ -301,6 +376,9 @@ class CreateCluster(Command):
         emrutils.apply_params(
             src_params=parsed_attrs, src_key='SubnetId',
             dest_params=instances, dest_key='Ec2SubnetId')
+        emrutils.apply_params(
+            src_params=parsed_attrs, src_key='SubnetIds',
+            dest_params=instances, dest_key='Ec2SubnetIds')
 
         if 'AvailabilityZone' in keys:
             instances['Placement'] = dict()
@@ -308,6 +386,13 @@ class CreateCluster(Command):
                 src_params=parsed_attrs, src_key='AvailabilityZone',
                 dest_params=instances['Placement'],
                 dest_key='AvailabilityZone')
+
+        if 'AvailabilityZones' in keys:
+            instances['Placement'] = dict()
+            emrutils.apply_params(
+                src_params=parsed_attrs, src_key='AvailabilityZones',
+                dest_params=instances['Placement'],
+                dest_key='AvailabilityZones')
 
         emrutils.apply_params(
             src_params=parsed_attrs, src_key='InstanceProfile',
@@ -451,8 +536,8 @@ class CreateCluster(Command):
                                                 parsed_args, parsed_configs):
         if parsed_args.use_default_roles:
             configurations = [x for x in configurations
-                              if x.name is not 'service_role'
-                              and x.name is not 'instance_profile']
+                              if x.name is not 'service_role' and
+                              x.name is not 'instance_profile']
         return configurations
 
     def _handle_emrfs_parameters(self, cluster, emrfs_args, release_label):

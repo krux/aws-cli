@@ -1,12 +1,23 @@
-**To Describe an Amazon RDS DB instance**
+**To describe a DB instance**
 
-The following ``describe-db-instances`` command describes all DB instances that are owned by the AWS account::
+This example describes a single DB instance (*test-instance*)::
 
-    aws rds describe-db-instances
+    aws rds describe-db-instances --db-instance-identifier test-instance
 
-This command output a JSON block that contains descriptive information about all the DB instances for this AWS account.
+Output::
+{
+    "DBInstance": {
+        "DBInstanceIdentifier": "test-instance",
+        "DBInstanceClass": "db.m1.small",
+        "Engine": "mysql",
+        "DBInstanceStatus": "available",
+        "MasterUsername": "myawsuser",
+        "Endpoint": {
+            "Address": "test-instance.cdgmuqiadpid.us-east-1.rds.amazonaws.com",
+            "Port": 3306,
+            "HostedZoneId": "Z2R2ITUGPM61AM"
+        },
 
-For more information, see `Describe an Amazon RDS DB Instance`_ in the *AWS Command Line Interface User Guide*.
+<...output omitted...>
 
-.. _`Describe an Amazon RDS DB Instance`: http://docs.aws.amazon.com/cli/latest/userguide/cli-rds-describe-instance.html
-
+}

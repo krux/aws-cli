@@ -42,6 +42,12 @@ class TestRecursiveShapes(unittest.TestCase):
         writes = '\n'.join(writes)
         self.assertIn(expected, writes)
 
+    def assert_proper_indentation(self):
+        indent = self.help_command.doc.style.indent.call_count
+        dedent = self.help_command.doc.style.dedent.call_count
+        message = 'Imbalanced indentation: indent (%s) != dedent (%s)'
+        self.assertEquals(indent, dedent, message % (indent, dedent))
+
     def test_handle_recursive_input(self):
         shape_map = {
             'RecursiveStruct': {
@@ -58,7 +64,7 @@ class TestRecursiveShapes(unittest.TestCase):
 
         self.arg_table['arg-name'] = mock.Mock(argument_model=shape)
         self.operation_handler.doc_option_example(
-            'arg-name', self.help_command)
+            'arg-name', self.help_command, 'process-cli-arg.foo.bar')
         self.assert_rendered_docs_contain('{ ... recursive ... }')
 
     def test_handle_recursive_output(self):
@@ -81,6 +87,24 @@ class TestRecursiveShapes(unittest.TestCase):
         self.operation_handler.doc_output(self.help_command, 'event-name')
         self.assert_rendered_docs_contain('( ... recursive ... )')
 
+    def test_handle_empty_nested_struct(self):
+        shape_map = {
+            'InputStruct': {
+                'type': 'structure',
+                'members': {
+                    'A': {'shape': 'Empty'},
+                }
+            },
+            'Empty': {'type': 'structure', 'members': {}}
+        }
+        shape = StructureShape('InputStruct', shape_map['InputStruct'],
+                               ShapeResolver(shape_map))
+
+        self.arg_table['arg-name'] = mock.Mock(argument_model=shape)
+        self.operation_handler.doc_option_example(
+            'arg-name', self.help_command, 'process-cli-arg.foo.bar')
+        self.assert_proper_indentation()
+
 
 class TestCLIDocumentEventHandler(unittest.TestCase):
     def setUp(self):
@@ -90,6 +114,17 @@ class TestCLIDocumentEventHandler(unittest.TestCase):
         self.arg_table = {}
         self.name = 'my-command'
         self.event_class = 'aws'
+
+    def create_help_command(self):
+        help_command = mock.Mock()
+        help_command.doc = ReSTDocument()
+        help_command.event_class = 'custom'
+        help_command.arg_table = {}
+        operation_model = mock.Mock()
+        operation_model.documentation = 'description'
+        operation_model.service_model.operation_names = []
+        help_command.obj = operation_model
+        return help_command
 
     def test_breadcrumbs_man(self):
         # Create an arbitrary help command class. This was chosen
@@ -157,6 +192,27 @@ class TestCLIDocumentEventHandler(unittest.TestCase):
              ' . :ref:`wait <cli:aws s3api wait>` ]')
         )
 
+    def test_documents_json_header_shape(self):
+        shape = {
+            'type': 'string',
+            'jsonvalue': True,
+            'location': 'header',
+            'locationName': 'X-Amz-Header-Name'
+        }
+        shape = StringShape('JSONValueArg', shape)
+        arg_table = {'arg-name': mock.Mock(argument_model=shape)}
+        help_command = mock.Mock()
+        help_command.doc = ReSTDocument()
+        help_command.event_class = 'custom'
+        help_command.arg_table = arg_table
+        operation_model = mock.Mock()
+        operation_model.service_model.operation_names = []
+        help_command.obj = operation_model
+        operation_handler = OperationDocumentEventHandler(help_command)
+        operation_handler.doc_option('arg-name', help_command)
+        rendered = help_command.doc.getvalue().decode('utf-8')
+        self.assertIn('(JSON)', rendered)
+
     def test_documents_enum_values(self):
         shape = {
             'type': 'string',
@@ -177,6 +233,72 @@ class TestCLIDocumentEventHandler(unittest.TestCase):
         self.assertIn('Possible values', rendered)
         self.assertIn('FOO', rendered)
         self.assertIn('BAZ', rendered)
+
+    def test_description_only_for_crosslink_manpage(self):
+        help_command = self.create_help_command()
+        operation_handler = OperationDocumentEventHandler(help_command)
+        operation_handler.doc_description(help_command=help_command)
+        rendered = help_command.doc.getvalue().decode('utf-8')
+        # The links are generated in the "man" mode.
+        self.assertIn('See also: AWS API Documentation', rendered)
+
+    def test_includes_webapi_crosslink_in_html(self):
+        help_command = self.create_help_command()
+        # Configure this for 'html' generation:
+        help_command.obj.service_model.metadata = {'uid': 'service-1-2-3'}
+        help_command.obj.name = 'myoperation'
+        help_command.doc.target = 'html'
+
+        operation_handler = OperationDocumentEventHandler(help_command)
+        operation_handler.doc_description(help_command=help_command)
+        rendered = help_command.doc.getvalue().decode('utf-8')
+        # Should expect an externa link because we're generating html.
+        self.assertIn(
+            'See also: `AWS API Documentation '
+            '<https://docs.aws.amazon.com/goto/'
+            'WebAPI/service-1-2-3/myoperation>`_', rendered)
+
+    def test_includes_global_args_ref_in_man_description(self):
+        help_command = self.create_help_command()
+        operation_handler = OperationDocumentEventHandler(help_command)
+        operation_handler.doc_description(help_command=help_command)
+        rendered = help_command.doc.getvalue().decode('utf-8')
+        # The links aren't generated in the "man" mode.
+        self.assertIn(
+            "See 'aws help' for descriptions of global parameters", rendered
+        )
+
+    def test_includes_global_args_ref_in_html_description(self):
+        help_command = self.create_help_command()
+        help_command.doc.target = 'html'
+        operation_handler = OperationDocumentEventHandler(help_command)
+        operation_handler.doc_description(help_command=help_command)
+        rendered = help_command.doc.getvalue().decode('utf-8')
+        self.assertIn(
+            "See :doc:`'aws help' </reference/index>` for descriptions of "
+            "global parameters", rendered
+        )
+
+    def test_includes_global_args_ref_in_man_options(self):
+        help_command = self.create_help_command()
+        operation_handler = OperationDocumentEventHandler(help_command)
+        operation_handler.doc_options_end(help_command=help_command)
+        rendered = help_command.doc.getvalue().decode('utf-8')
+        # The links aren't generated in the "man" mode.
+        self.assertIn(
+            "See 'aws help' for descriptions of global parameters", rendered
+        )
+
+    def test_includes_global_args_ref_in_html_options(self):
+        help_command = self.create_help_command()
+        help_command.doc.target = 'html'
+        operation_handler = OperationDocumentEventHandler(help_command)
+        operation_handler.doc_options_end(help_command=help_command)
+        rendered = help_command.doc.getvalue().decode('utf-8')
+        self.assertIn(
+            "See :doc:`'aws help' </reference/index>` for descriptions of "
+            "global parameters", rendered
+        )
 
 
 class TestTopicDocumentEventHandlerBase(unittest.TestCase):

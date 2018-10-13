@@ -16,6 +16,10 @@ import os
 
 
 from botocore.compat import json
+from tests.unit.customizations.emr import test_constants as \
+    CONSTANTS
+from tests.unit.customizations.emr import test_constants_instance_fleets as \
+    CONSTANTS_FLEET
 from tests.unit.customizations.emr import EMRBaseAWSCommandParamsTest as \
     BaseAWSCommandParamsTest
 from mock import patch
@@ -62,6 +66,19 @@ DEFAULT_INSTANCES = {'KeepJobFlowAliveWhenNoSteps': True,
 
 EC2_ROLE_NAME = "EMR_EC2_DefaultRole"
 EMR_ROLE_NAME = "EMR_DefaultRole"
+
+DEFAULT_KERBEROS_ATTRIBUTES_ARGS = 'Realm=EC2.INTERNAL,' \
+                                   'KdcAdminPassword=123,' \
+                                   'CrossRealmTrustPrincipalPassword=123,' \
+                                   'ADDomainJoinUser=aws,' \
+                                   'ADDomainJoinPassword=123'
+
+KERBEROS_ATTRIBUTES = {'Realm': 'EC2.INTERNAL',
+                       'KdcAdminPassword': '123',
+                       'CrossRealmTrustPrincipalPassword': '123',
+                       'ADDomainJoinUser': 'aws',
+                       'ADDomainJoinPassword': '123'
+                      }
 
 TEST_BA = [
     {
@@ -646,6 +663,36 @@ class TestCreateCluster(BaseAWSCommandParamsTest):
         ]
         self.assert_params_for_cmd(cmd, result)
 
+    def test_instance_groups_from_json_file_spot_bidprice_equals_ondemandprice(self):
+        data_path = os.path.join(
+            os.path.dirname(__file__), 'input_instance_groups_spot_bidprice_equals_ondemandprice.json')
+        cmd = ('emr create-cluster --use-default-roles'
+               ' --release-label emr-4.0.0  '
+               '--instance-groups file://' + data_path)
+        result = copy.deepcopy(DEFAULT_RESULT)
+        result['Instances']['InstanceGroups'] = \
+            [
+                {'InstanceRole': 'MASTER',
+                 'InstanceCount': 1,
+                 'Name': 'Master Instance Group',
+                 'Market': 'SPOT',
+                 'InstanceType': 'm1.large'
+                 },
+                {'InstanceRole': 'CORE',
+                 'InstanceCount': 2,
+                 'Name': 'Core Instance Group',
+                 'Market': 'SPOT',
+                 'InstanceType': 'm1.xlarge'
+                 },
+                {'InstanceRole': 'TASK',
+                 'InstanceCount': 3,
+                 'Name': 'Task Instance Group',
+                 'Market': 'SPOT',
+                 'InstanceType': 'm1.xlarge'
+                 }
+        ]
+        self.assert_params_for_cmd(cmd, result)
+
     def test_ec2_attributes_no_az(self):
         cmd = ('emr create-cluster --release-label emr-4.0.0 '
                '--instance-groups ' + DEFAULT_INSTANCE_GROUPS_ARG +
@@ -980,6 +1027,330 @@ class TestCreateCluster(BaseAWSCommandParamsTest):
         instances['AdditionalSlaveSecurityGroups'] = \
             ADDITIONAL_SLAVE_SECURITY_GROUPS
 
+        self.assert_params_for_cmd(cmd, result)
+
+    def test_instance_group_with_autoscaling_policy(self):
+        cmd = (self.prefix + '--release-label emr-4.2.0 --auto-scaling-role EMR_AUTOSCALING_ROLE --instance-groups ' +
+               CONSTANTS.INSTANCE_GROUPS_WITH_AUTOSCALING_POLICY_ARG)
+        result = \
+            {
+                'Name': DEFAULT_CLUSTER_NAME,
+                'Instances': {'KeepJobFlowAliveWhenNoSteps': True,
+                              'TerminationProtected': False,
+                              'InstanceGroups': CONSTANTS.INSTANCE_GROUPS_WITH_AUTOSCALING_POLICY
+                              },
+                'ReleaseLabel': 'emr-4.2.0',
+                'AutoScalingRole': 'EMR_AUTOSCALING_ROLE',
+                'VisibleToAllUsers': True,
+                'Tags': []
+            }
+        self.assert_params_for_cmd(cmd, result)
+
+    def test_instance_group_with_autoscaling_policy_missing_autoscaling_role(self):
+        cmd = (self.prefix + '--release-label emr-4.2.0 --instance-groups ' +
+               CONSTANTS.INSTANCE_GROUPS_WITH_AUTOSCALING_POLICY_ARG)
+        expected_error_msg = (
+            '\naws: error: Must specify --auto-scaling-role when'
+            ' configuring an AutoScaling policy for an instance group.\n')
+        result = self.run_cmd(cmd, 255)
+        self.assertEquals(expected_error_msg, result[1])
+        
+    def test_scale_down_behavior(self):
+        cmd = (self.prefix + '--release-label emr-4.0.0 --scale-down-behavior TERMINATE_AT_INSTANCE_HOUR '
+                             '--instance-groups ' + DEFAULT_INSTANCE_GROUPS_ARG)
+        result = \
+            {
+                'Name': DEFAULT_CLUSTER_NAME,
+                'Instances': DEFAULT_INSTANCES,
+                'ReleaseLabel': 'emr-4.0.0',
+                'VisibleToAllUsers': True,
+                'ScaleDownBehavior': 'TERMINATE_AT_INSTANCE_HOUR',
+                'Tags': []
+            }
+        self.assert_params_for_cmd(cmd, result)
+
+    def test_instance_group_with_ebs_config(self):
+        cmd = (self.prefix + '--release-label emr-4.2.0 --instance-groups ' +
+               CONSTANTS.INSTANCE_GROUPS_WITH_EBS_VOLUME_ARG)
+        result = \
+            {
+                'Name': DEFAULT_CLUSTER_NAME,
+                'Instances': {'KeepJobFlowAliveWhenNoSteps': True,
+                              'TerminationProtected': False,
+                              'InstanceGroups': CONSTANTS.INSTANCE_GROUPS_WITH_EBS
+                              },
+                'ReleaseLabel': 'emr-4.2.0',
+                'VisibleToAllUsers': True,
+                'Tags': []
+            }
+        self.assert_params_for_cmd(cmd, result)
+
+    def test_instance_groups_with_ebs_config_missing_volume_type(self):
+        cmd = (self.prefix + '--release-label emr-4.2.0 --instance-groups ' +
+               CONSTANTS.INSTANCE_GROUPS_WITH_EBS_VOLUME_MISSING_VOLTYPE_ARG)
+        stderr = self.run_cmd(cmd, 255)[1]
+        self.assert_error_message_has_field_name(stderr, 'VolumeType')
+
+    def test_instance_groups_with_ebs_config_missing_size(self):
+        cmd = (self.prefix + '--release-label emr-4.2.0 --instance-groups ' +
+               CONSTANTS.INSTANCE_GROUPS_WITH_EBS_VOLUME_MISSING_SIZE_ARG)
+        stderr = self.run_cmd(cmd, 255)[1]
+        self.assert_error_message_has_field_name(stderr, 'SizeInGB')
+
+    def test_instance_groups_with_ebs_config_missing_volume_spec(self):
+        cmd = (self.prefix + '--release-label emr-4.2.0 --instance-groups ' +
+               CONSTANTS.INSTANCE_GROUPS_WITH_EBS_VOLUME_MISSING_VOLSPEC_ARG)
+        result = \
+            {
+                'Name': DEFAULT_CLUSTER_NAME,
+                'Instances': {'KeepJobFlowAliveWhenNoSteps': True,
+                              'TerminationProtected': False,
+                              'InstanceGroups': CONSTANTS.INSTANCE_GROUPS_WITH_EBS_VOLUME_MISSING_VOLSPEC
+                              },
+                'ReleaseLabel': 'emr-4.2.0',
+                'VisibleToAllUsers': True,
+                'Tags': []
+            }
+        self.assert_params_for_cmd(cmd, result)
+
+    def test_instance_groups_with_ebs_config_missing_iops(self):
+        cmd = (self.prefix + '--release-label emr-4.2.0 --instance-groups ' +
+               CONSTANTS.INSTANCE_GROUPS_WITH_EBS_VOLUME_MISSING_IOPS_ARG)
+        result = \
+            {
+                'Name': DEFAULT_CLUSTER_NAME,
+                'Instances': {'KeepJobFlowAliveWhenNoSteps': True,
+                              'TerminationProtected': False,
+                              'InstanceGroups': CONSTANTS.INSTANCE_GROUPS_WITH_EBS_VOLUME_MISSING_IOPS
+                              },
+                'ReleaseLabel': 'emr-4.2.0',
+                'VisibleToAllUsers': True,
+                'Tags': []
+            }
+        self.assert_params_for_cmd(cmd, result)
+
+    def test_instance_groups_with_ebs_config_multiple_instance_groups(self):
+        cmd = (self.prefix + '--release-label emr-4.2.0 --instance-groups ' +
+               CONSTANTS.MULTIPLE_INSTANCE_GROUPS_WITH_EBS_VOLUMES_VOLUME_ARG)
+        result = \
+            {
+                'Name': DEFAULT_CLUSTER_NAME,
+                'Instances': {'KeepJobFlowAliveWhenNoSteps': True,
+                              'TerminationProtected': False,
+                              'InstanceGroups': CONSTANTS.MULTIPLE_INSTANCE_GROUPS_WITH_EBS_VOLUMES
+                              },
+                'ReleaseLabel': 'emr-4.2.0',
+                'VisibleToAllUsers': True,
+                'Tags': []
+            }
+        self.assert_params_for_cmd(cmd, result)
+
+    def test_instance_fleets_with_on_demand_master_only(self):
+        cmd = (self.prefix + '--release-label emr-4.2.0 --instance-fleets ' +
+               CONSTANTS_FLEET.INSTANCE_FLEETS_WITH_ON_DEMAND_MASTER_ONLY)
+        result = \
+            {
+                'Name': DEFAULT_CLUSTER_NAME,
+                'Instances': {'KeepJobFlowAliveWhenNoSteps': True,
+                              'TerminationProtected': False,
+                              'InstanceFleets':
+                                                CONSTANTS_FLEET.RES_INSTANCE_FLEETS_WITH_ON_DEMAND_MASTER_ONLY
+                            },
+                'ReleaseLabel': 'emr-4.2.0',
+                'VisibleToAllUsers': True,
+                'Tags': []
+            }
+        self.assert_params_for_cmd(cmd, result)
+
+    def test_instance_fleets_with_spot_master_only_with_ebs_conf(self):
+        cmd = (self.prefix + '--release-label emr-4.2.0 --instance-fleets ' +
+               CONSTANTS_FLEET.INSTANCE_FLEETS_WITH_SPOT_MASTER_ONLY_WITH_EBS_CONF)
+        result = \
+            {
+                'Name': DEFAULT_CLUSTER_NAME,
+                'Instances': {'KeepJobFlowAliveWhenNoSteps': True,
+                              'TerminationProtected': False,
+                              'InstanceFleets':
+                                                CONSTANTS_FLEET.RES_INSTANCE_FLEETS_WITH_SPOT_MASTER_ONLY_WITH_EBS_CONF
+                            },
+                'ReleaseLabel': 'emr-4.2.0',
+                'VisibleToAllUsers': True,
+                'Tags': []
+            }
+        self.assert_params_for_cmd(cmd, result)
+
+    def test_instance_fleets_with_spot_master_specific_azs(self):
+        cmd = (self.prefix + '--release-label emr-4.2.0 --instance-fleets ' +
+               CONSTANTS_FLEET.INSTANCE_FLEETS_WITH_SPOT_MASTER_ONLY +
+               ' --ec2-attributes AvailabilityZones=[us-east-1a,us-east-1b]')
+        result = \
+            {
+                'Name': DEFAULT_CLUSTER_NAME,
+                'Instances': {'KeepJobFlowAliveWhenNoSteps': True,
+                              'TerminationProtected': False,
+                              'InstanceFleets':
+                                                CONSTANTS_FLEET.RES_INSTANCE_FLEETS_WITH_SPOT_MASTER_ONLY,
+                              'Placement': {'AvailabilityZones': ['us-east-1a','us-east-1b']}
+                            },
+                'ReleaseLabel': 'emr-4.2.0',
+                'VisibleToAllUsers': True,
+                'Tags': []
+            }
+        self.assert_params_for_cmd(cmd, result)
+
+    def test_instance_fleets_with_spot_master_subnet_ids(self):
+        cmd = (self.prefix + '--release-label emr-4.2.0 --instance-fleets ' +
+               CONSTANTS_FLEET.INSTANCE_FLEETS_WITH_SPOT_MASTER_ONLY +
+               ' --ec2-attributes SubnetIds=[subnetid-1,subnetid-2]')
+        result = \
+            {
+                'Name': DEFAULT_CLUSTER_NAME,
+                'Instances': {'KeepJobFlowAliveWhenNoSteps': True,
+                              'TerminationProtected': False,
+                              'InstanceFleets':
+                                                CONSTANTS_FLEET.RES_INSTANCE_FLEETS_WITH_SPOT_MASTER_ONLY,
+                              'Ec2SubnetIds': ['subnetid-1','subnetid-2']
+                            },
+                'ReleaseLabel': 'emr-4.2.0',
+                'VisibleToAllUsers': True,
+                'Tags': []
+            }
+        self.assert_params_for_cmd(cmd, result)
+
+    def test_instance_fleets_with_spot_master_core_cluster_multiple_instance_types(self):
+        cmd = (self.prefix + '--release-label emr-4.2.0 --instance-fleets ' +
+               CONSTANTS_FLEET.INSTANCE_FLEETS_WITH_SPOT_MASTER_CORE_CLUSTER)
+        result = \
+            {
+                'Name': DEFAULT_CLUSTER_NAME,
+                'Instances': {'KeepJobFlowAliveWhenNoSteps': True,
+                              'TerminationProtected': False,
+                              'InstanceFleets':
+                                                CONSTANTS_FLEET.RES_INSTANCE_FLEETS_WITH_SPOT_MASTER_CORE_CLUSTER
+                            },
+                'ReleaseLabel': 'emr-4.2.0',
+                'VisibleToAllUsers': True,
+                'Tags': []
+            }
+        self.assert_params_for_cmd(cmd, result)
+
+    def test_instance_fleets_with_complex_config_from_json(self):
+        data_path = os.path.join(
+            os.path.dirname(__file__), 'input_instance_fleets.json')
+        cmd = ('emr create-cluster --use-default-roles --release-label emr-4.2.0  '
+                '--instance-fleets file://' + data_path)
+        result = \
+            {
+                'Name': DEFAULT_CLUSTER_NAME,
+                'Instances': {'KeepJobFlowAliveWhenNoSteps': True,
+                              'TerminationProtected': False,
+                              'InstanceFleets':
+                                                CONSTANTS_FLEET.RES_INSTANCE_FLEETS_WITH_COMPLEX_CONFIG_FROM_JSON
+                            },
+                'ReleaseLabel': 'emr-4.2.0',
+                'VisibleToAllUsers': True,
+                'Tags': [],
+                'JobFlowRole': 'EMR_EC2_DefaultRole',
+                'ServiceRole': 'EMR_DefaultRole'
+            }
+        self.assert_params_for_cmd(cmd, result)
+
+    def test_instance_fleets_with_both_fleet_group_specified(self):
+        cmd = (self.prefix + '--release-label emr-4.2.0 --instance-fleets ' +
+               CONSTANTS_FLEET.INSTANCE_FLEETS_WITH_SPOT_MASTER_ONLY +
+               ' --instance-groups ' + CONSTANTS.INSTANCE_GROUPS_WITH_EBS_VOLUME_ARG)
+        expected_error_msg = (
+            '\naws: error: You cannot specify both --instance-groups'
+            ' and --instance-fleets options together.\n')
+        result = self.run_cmd(cmd, 255)
+        self.assertEquals(expected_error_msg, result[1])
+
+    def test_instance_fleets_with_both_subnetid_subnetids_specified(self):
+        cmd = (self.prefix + '--release-label emr-4.2.0 --instance-fleets ' +
+               CONSTANTS_FLEET.INSTANCE_FLEETS_WITH_SPOT_MASTER_ONLY +
+               ' --ec2-attributes SubnetId=subnetid-1,SubnetIds=[subnetid-1,subnetid-2]')
+        expected_error_msg = (
+            '\naws: error: You cannot specify both SubnetId'
+            ' and SubnetIds options together.\n')
+        result = self.run_cmd(cmd, 255)
+        self.assertEquals(expected_error_msg, result[1])
+
+    def test_create_cluster_with_security_config(self):
+        cmd = (self.prefix + '--release-label emr-4.7.2 --security-configuration MySecurityConfig '+ 
+               '--instance-groups ' + DEFAULT_INSTANCE_GROUPS_ARG)
+        result = \
+            {
+                'Name': DEFAULT_CLUSTER_NAME,
+                'Instances': DEFAULT_INSTANCES,
+                'ReleaseLabel': 'emr-4.7.2',
+                'VisibleToAllUsers': True,
+                'Tags': [],
+                'SecurityConfiguration': 'MySecurityConfig'
+            }
+        self.assert_params_for_cmd(cmd, result)
+
+    def test_create_cluster_with_security_config_and_kerberos_attributes(self):
+        cmd = (self.prefix + '--release-label emr-4.7.2 --security-configuration MySecurityConfig' +
+               ' --kerberos-attributes ' + DEFAULT_KERBEROS_ATTRIBUTES_ARGS +
+               ' --instance-groups ' + DEFAULT_INSTANCE_GROUPS_ARG)
+        result = \
+            {
+                'Name': DEFAULT_CLUSTER_NAME,
+                'Instances': DEFAULT_INSTANCES,
+                'KerberosAttributes': KERBEROS_ATTRIBUTES,
+                'ReleaseLabel': 'emr-4.7.2',
+                'VisibleToAllUsers': True,
+                'Tags': [],
+                'SecurityConfiguration': 'MySecurityConfig'
+            }
+        self.assert_params_for_cmd(cmd, result)
+
+    def test_create_cluster_with_custom_ami_id(self):
+        cmd = (self.prefix + '--release-label emr-4.7.2 --security-configuration MySecurityConfig '+
+               ' --custom-ami-id ami-9be6f38c' +
+               ' --instance-groups ' + DEFAULT_INSTANCE_GROUPS_ARG)
+        result = \
+            {
+                'Name': DEFAULT_CLUSTER_NAME,
+                'Instances': DEFAULT_INSTANCES,
+                'ReleaseLabel': 'emr-4.7.2',
+                'VisibleToAllUsers': True,
+                'Tags': [],
+                'CustomAmiId': 'ami-9be6f38c',
+                'SecurityConfiguration': 'MySecurityConfig'
+            }
+        self.assert_params_for_cmd(cmd, result)
+
+    def test_create_cluster_with_ebs_root_volume_size(self):
+        cmd = (self.prefix + '--release-label emr-4.7.2 --security-configuration MySecurityConfig '+
+               ' --ebs-root-volume-size 50' +
+               ' --instance-groups ' + DEFAULT_INSTANCE_GROUPS_ARG)
+        result = \
+            {
+                'Name': DEFAULT_CLUSTER_NAME,
+                'Instances': DEFAULT_INSTANCES,
+                'ReleaseLabel': 'emr-4.7.2',
+                'VisibleToAllUsers': True,
+                'Tags': [],
+                'EbsRootVolumeSize': 50,
+                'SecurityConfiguration': 'MySecurityConfig'
+            }
+        self.assert_params_for_cmd(cmd, result)
+
+    def test_create_cluster_with_repo_upgrade_on_boot(self):
+        cmd = (self.prefix + '--release-label emr-4.7.2 --security-configuration MySecurityConfig '+
+               ' --repo-upgrade-on-boot NONE' +
+               ' --instance-groups ' + DEFAULT_INSTANCE_GROUPS_ARG)
+        result = \
+            {
+                'Name': DEFAULT_CLUSTER_NAME,
+                'Instances': DEFAULT_INSTANCES,
+                'ReleaseLabel': 'emr-4.7.2',
+                'VisibleToAllUsers': True,
+                'Tags': [],
+                'RepoUpgradeOnBoot': 'NONE',
+                'SecurityConfiguration': 'MySecurityConfig'
+            }
         self.assert_params_for_cmd(cmd, result)
 
 if __name__ == "__main__":
