@@ -19,7 +19,7 @@ class EmrError(Exception):
 
     :ivar msg: The descriptive message associated with the error.
     """
-    fmt = 'An unspecified error occured'
+    fmt = 'An unspecified error occurred'
 
     def __init__(self, **kwargs):
         msg = self.fmt.format(**kwargs)
@@ -145,9 +145,9 @@ class LogUriError(EmrError):
 class MasterDNSNotAvailableError(EmrError):
 
     """
-    Cannot get public dns of master node on the cluster.
+    Cannot get dns of master node on the cluster.
     """
-    fmt = 'Cannot get Public DNS of master node on the cluster. '\
+    fmt = 'Cannot get DNS of master node on the cluster. '\
           ' Please try again after some time.'
 
 
@@ -334,3 +334,9 @@ class UnsupportedCommandWithReleaseError(EmrError):
 
     fmt = ("aws: error: {command} is not supported with "
            "'{release_label}' release.")
+
+class MissingAutoScalingRoleError(EmrError):
+
+    fmt = ("aws: error: Must specify --auto-scaling-role when configuring an "
+           "AutoScaling policy for an instance group.")
+

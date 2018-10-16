@@ -16,11 +16,11 @@ import stat
 
 from dateutil.parser import parse
 from dateutil.tz import tzlocal
+from botocore.exceptions import ClientError
 
 from awscli.customizations.s3.utils import find_bucket_key, get_file_stat
 from awscli.customizations.s3.utils import BucketLister, create_warning, \
     find_dest_path_comp_key, EPOCH_TIME
-from awscli.errorhandler import ClientError
 from awscli.compat import six
 from awscli.compat import queue
 
@@ -31,7 +31,7 @@ def is_special_file(path):
     """
     This function checks to see if a special file.  It checks if the
     file is a character special device, block special device, FIFO, or
-    socket. 
+    socket.
     """
     mode = os.stat(path).st_mode
     # Character special device.
@@ -172,10 +172,9 @@ class FileGenerator(object):
         error, listdir = os.error, os.listdir
         if not self.should_ignore_file(path):
             if not dir_op:
-                size, last_update = get_file_stat(path)
-                last_update = self._validate_update_time(last_update, path)
-                yield path, {'Size': size, 'LastModified': last_update}
-
+                stats = self._safely_get_file_stats(path)
+                if stats:
+                    yield stats
             else:
                 # We need to list files in byte order based on the full
                 # expanded path of the key: 'test/1/2/3.txt'  However,
@@ -208,13 +207,18 @@ class FileGenerator(object):
                         for x in self.list_files(file_path, dir_op):
                             yield x
                     else:
-                        size, last_update = get_file_stat(file_path)
-                        last_update = self._validate_update_time(
-                            last_update, path)
-                        yield (
-                            file_path,
-                            {'Size': size, 'LastModified': last_update}
-                        )
+                        stats = self._safely_get_file_stats(file_path)
+                        if stats:
+                            yield stats
+
+    def _safely_get_file_stats(self, file_path):
+        try:
+            size, last_update = get_file_stat(file_path)
+        except (OSError, ValueError):
+            self.triggers_warning(file_path)
+        else:
+            last_update = self._validate_update_time(last_update, file_path)
+            return file_path, {'Size': size, 'LastModified': last_update}
 
     def _validate_update_time(self, update_time, path):
         # If the update time is None we know we ran into an invalid tiemstamp.
@@ -314,8 +318,10 @@ class FileGenerator(object):
             yield self._list_single_object(s3_path)
         else:
             lister = BucketLister(self._client)
+            extra_args = self.request_parameters.get('ListObjectsV2', {})
             for key in lister.list_objects(bucket=bucket, prefix=prefix,
-                                           page_size=self.page_size):
+                                           page_size=self.page_size,
+                                           extra_args=extra_args):
                 source_path, response_data = key
                 if response_data['Size'] == 0 and source_path.endswith('/'):
                     if self.operation_name == 'delete':
@@ -336,6 +342,12 @@ class FileGenerator(object):
         # a ListObjects operation (which causes concern for anyone setting
         # IAM policies with the smallest set of permissions needed) and
         # instead use a HeadObject request.
+        if self.operation_name == 'delete':
+            # If the operation is just a single remote delete, there is
+            # no need to run HeadObject on the S3 object as none of the
+            # information gained from HeadObject is required to delete the
+            # object.
+            return s3_path, {'Size': None, 'LastModified': None}
         bucket, key = find_bucket_key(s3_path)
         try:
             params = {'Bucket': bucket, 'Key': key}
@@ -345,19 +357,13 @@ class FileGenerator(object):
             # We want to try to give a more helpful error message.
             # This is what the customer is going to see so we want to
             # give as much detail as we have.
-            copy_fields = e.__dict__.copy()
-            if not e.error_message == 'Not Found':
+            if not e.response['Error']['Code'] == '404':
                 raise
-            if e.http_status_code == 404:
-                # The key does not exist so we'll raise a more specific
-                # error message here.
-                copy_fields['error_message'] = 'Key "%s" does not exist' % key
-            else:
-                reason = six.moves.http_client.responses[
-                    e.http_status_code]
-                copy_fields['error_code'] = reason
-                copy_fields['error_message'] = reason
-            raise ClientError(**copy_fields)
+            # The key does not exist so we'll raise a more specific
+            # error message here.
+            response = e.response.copy()
+            response['Error']['Message'] = 'Key "%s" does not exist' % key
+            raise ClientError(response, 'HeadObject')
         response['Size'] = int(response.pop('ContentLength'))
         last_update = parse(response['LastModified'])
         response['LastModified'] = last_update.astimezone(tzlocal())

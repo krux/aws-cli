@@ -25,12 +25,12 @@ import copy
 import shutil
 import time
 import json
-import random
 import logging
 import tempfile
 import platform
 import contextlib
 import string
+import binascii
 from pprint import pformat
 from subprocess import Popen, PIPE
 
@@ -43,15 +43,15 @@ except ImportError as e:
     # In the off chance something imports this module
     # that's not suppose to, we should not stop the CLI
     # by raising an ImportError.  Now if anything actually
-    # *uses* this module that isn't suppose to, that's s
+    # *uses* this module that isn't suppose to, that's a
     # different story.
     mock = None
 from awscli.compat import six
-from botocore.hooks import HierarchicalEmitter
 from botocore.session import Session
 from botocore.exceptions import ClientError
+from botocore.exceptions import WaiterError
 import botocore.loaders
-from botocore.vendored import requests
+from botocore.awsrequest import AWSResponse
 
 import awscli.clidriver
 from awscli.plugin import load_plugins
@@ -95,6 +95,18 @@ def skip_if_windows(reason):
         return unittest.skipIf(
             platform.system() not in ['Darwin', 'Linux'], reason)(func)
     return decorator
+
+
+def set_invalid_utime(path):
+    """Helper function to set an invalid last modified time"""
+    try:
+        os.utime(path, (-1, -100000000000))
+    except (OSError, OverflowError):
+        # Some OS's such as Windows throws an error for trying to set a
+        # last modified time of that size. So if an error is thrown, set it
+        # to just a negative time which will trigger the warning as well for
+        # Windows.
+        os.utime(path, (-1, -1))
 
 
 def create_clidriver():
@@ -152,7 +164,7 @@ def temporary_file(mode):
 
     """
     temporary_directory = tempfile.mkdtemp()
-    basename = 'tmpfile-%s-%s' % (int(time.time()), random.randint(1, 1000))
+    basename = 'tmpfile-%s' % str(random_chars(8))
     full_filename = os.path.join(temporary_directory, basename)
     open(full_filename, 'w').close()
     try:
@@ -173,16 +185,11 @@ def create_bucket(session, name=None, region=None):
     if name:
         bucket_name = name
     else:
-        rand1 = ''.join(random.sample(string.ascii_lowercase + string.digits,
-                                      10))
-        bucket_name = 'awscli-s3test-' + str(rand1)
+        bucket_name = random_bucket_name()
     params = {'Bucket': bucket_name}
     if region != 'us-east-1':
         params['CreateBucketConfiguration'] = {'LocationConstraint': region}
     try:
-        # To disable the (obsolete) awscli.errorhandler.ClientError behavior
-        client.meta.events.unregister(
-            'after-call', unique_id='awscli-error-handler')
         client.create_bucket(**params)
     except ClientError as e:
         if e.response['Error'].get('Code') == 'BucketAlreadyOwnedByYou':
@@ -193,6 +200,29 @@ def create_bucket(session, name=None, region=None):
         else:
             raise
     return bucket_name
+
+
+def random_chars(num_chars):
+    """Returns random hex characters.
+
+    Useful for creating resources with random names.
+
+    """
+    return binascii.hexlify(os.urandom(int(num_chars / 2))).decode('ascii')
+
+
+def random_bucket_name(prefix='awscli-s3integ-', num_random=10):
+    """Generate a random S3 bucket name.
+
+    :param prefix: A prefix to use in the bucket name.  Useful
+        for tracking resources.  This default value makes it easy
+        to see which buckets were created from CLI integ tests.
+    :param num_random: Number of random chars to include in the bucket name.
+
+    :returns: The name of a randomly generated bucket name as a string.
+
+    """
+    return prefix + random_chars(num_random)
 
 
 class BaseCLIDriverTest(unittest.TestCase):
@@ -211,13 +241,8 @@ class BaseCLIDriverTest(unittest.TestCase):
         }
         self.environ_patch = mock.patch('os.environ', self.environ)
         self.environ_patch.start()
-        emitter = HierarchicalEmitter()
-        session = Session(EnvironmentVariables, emitter)
-        session.register_component('data_loader', _LOADER)
-        load_plugins({}, event_hooks=emitter)
-        driver = CLIDriver(session=session)
-        self.session = session
-        self.driver = driver
+        self.driver = create_clidriver()
+        self.session = self.driver.session
 
     def tearDown(self):
         self.environ_patch.stop()
@@ -297,11 +322,25 @@ def capture_output():
             yield CapturedOutput(stdout, stderr)
 
 
+@contextlib.contextmanager
+def capture_input(input_bytes=b''):
+    input_data = six.BytesIO(input_bytes)
+    if six.PY3:
+        mock_object = mock.Mock()
+        mock_object.buffer = input_data
+    else:
+        mock_object = input_data
+
+    with mock.patch('sys.stdin', mock_object):
+        yield input_data
+
+
 class BaseAWSCommandParamsTest(unittest.TestCase):
     maxDiff = None
 
     def setUp(self):
         self.last_params = {}
+        self.last_kwargs = None
         # awscli/__init__.py injects AWS_DATA_PATH at import time
         # so that we can find cli.json.  This might be fixed in the
         # future, but for now we just grab that value out of the real
@@ -312,11 +351,12 @@ class BaseAWSCommandParamsTest(unittest.TestCase):
             'AWS_DEFAULT_REGION': 'us-east-1',
             'AWS_ACCESS_KEY_ID': 'access_key',
             'AWS_SECRET_ACCESS_KEY': 'secret_key',
+            'AWS_CONFIG_FILE': '',
+            'AWS_SHARED_CREDENTIALS_FILE': '',
         }
         self.environ_patch = mock.patch('os.environ', self.environ)
         self.environ_patch.start()
-        self.http_response = requests.models.Response()
-        self.http_response.status_code = 200
+        self.http_response = AWSResponse(None, 200, {}, None)
         self.parsed_response = {}
         self.make_request_patch = mock.patch('botocore.endpoint.Endpoint.make_request')
         self.make_request_is_patched = False
@@ -420,6 +460,59 @@ class BaseAWSPreviewCommandParamsTest(BaseAWSCommandParamsTest):
     def tearDown(self):
         self.preview_patch.stop()
         super(BaseAWSPreviewCommandParamsTest, self).tearDown()
+
+
+class BaseCLIWireResponseTest(unittest.TestCase):
+    def setUp(self):
+        self.environ = {
+            'AWS_DATA_PATH': os.environ['AWS_DATA_PATH'],
+            'AWS_DEFAULT_REGION': 'us-east-1',
+            'AWS_ACCESS_KEY_ID': 'access_key',
+            'AWS_SECRET_ACCESS_KEY': 'secret_key',
+            'AWS_CONFIG_FILE': ''
+        }
+        self.environ_patch = mock.patch('os.environ', self.environ)
+        self.environ_patch.start()
+        # TODO: fix this patch when we have a better way to stub out responses
+        self.send_patch = mock.patch('botocore.endpoint.Endpoint._send')
+        self.send_is_patched = False
+        self.driver = create_clidriver()
+
+    def tearDown(self):
+        self.environ_patch.stop()
+        if self.send_is_patched:
+            self.send_patch.stop()
+            self.send_is_patched = False
+
+    def patch_send(self, status_code=200, headers={}, content=b''):
+        if self.send_is_patched:
+            self.send_patch.stop()
+            self.send_is_patched = False
+        send_patch = self.send_patch.start()
+        send_patch.return_value = mock.Mock(status_code=status_code,
+                                            headers=headers,
+                                            content=content)
+        self.send_is_patched = True
+
+    def run_cmd(self, cmd, expected_rc=0):
+        if not isinstance(cmd, list):
+            cmdlist = cmd.split()
+        else:
+            cmdlist = cmd
+        with capture_output() as captured:
+            try:
+                rc = self.driver.main(cmdlist)
+            except SystemExit as e:
+                rc = e.code
+        stderr = captured.stderr.getvalue()
+        stdout = captured.stdout.getvalue()
+        self.assertEqual(
+            rc, expected_rc,
+            "Unexpected rc (expected: %s, actual: %s) for command: %s\n"
+            "stdout:\n%sstderr:\n%s" % (
+                expected_rc, rc, cmd, stdout, stderr))
+        return stdout, stderr, rc
+
 
 
 class FileCreator(object):
@@ -556,7 +649,8 @@ def aws(command, collect_memory=False, env_vars=None,
         full_command = full_command.encode(stdout_encoding)
     INTEG_LOG.debug("Running command: %s", full_command)
     env = os.environ.copy()
-    env['AWS_DEFAULT_REGION'] = "us-east-1"
+    if 'AWS_DEFAULT_REGION' not in env:
+        env['AWS_DEFAULT_REGION'] = "us-east-1"
     if env_vars is not None:
         env = env_vars
     if input_file is None:
@@ -632,6 +726,7 @@ class BaseS3CLICommand(unittest.TestCase):
     and more streamlined.
 
     """
+
     def setUp(self):
         self.files = FileCreator()
         self.session = botocore.session.get_session()
@@ -652,6 +747,15 @@ class BaseS3CLICommand(unittest.TestCase):
         # Subclasses can use this to define extra teardown steps.
         pass
 
+    def override_parser(self, **kwargs):
+        factory = self.session.get_component('response_parser_factory')
+        factory.set_parser_defaults(**kwargs)
+
+    def create_client_for_bucket(self, bucket_name):
+        region = self.regions.get(bucket_name, self.region)
+        client = self.session.create_client('s3', region_name=region)
+        return client
+
     def assert_key_contents_equal(self, bucket, key, expected_contents):
         if isinstance(expected_contents, six.BytesIO):
             expected_contents = expected_contents.getvalue().decode('utf-8')
@@ -669,11 +773,13 @@ class BaseS3CLICommand(unittest.TestCase):
         bucket_name = create_bucket(self.session, name, region)
         self.regions[bucket_name] = region
         self.addCleanup(self.delete_bucket, bucket_name)
+
+        # Wait for the bucket to exist before letting it be used.
+        self.wait_bucket_exists(bucket_name)
         return bucket_name
 
     def put_object(self, bucket_name, key_name, contents='', extra_args=None):
-        client = self.session.create_client(
-            's3', region_name=self.regions[bucket_name])
+        client = self.create_client_for_bucket(bucket_name)
         call_args = {
             'Bucket': bucket_name,
             'Key': key_name, 'Body': contents
@@ -683,16 +789,31 @@ class BaseS3CLICommand(unittest.TestCase):
         response = client.put_object(**call_args)
         self.addCleanup(self.delete_key, bucket_name, key_name)
 
-    def delete_bucket(self, bucket_name):
+    def delete_bucket(self, bucket_name, attempts=5, delay=5):
         self.remove_all_objects(bucket_name)
-        client = self.session.create_client(
-            's3', region_name=self.regions[bucket_name])
-        response = client.delete_bucket(Bucket=bucket_name)
-        del self.regions[bucket_name]
+        client = self.create_client_for_bucket(bucket_name)
+
+        # There's a chance that, even though the bucket has been used
+        # several times, the delete will fail due to eventual consistency
+        # issues.
+        attempts_remaining = attempts
+        while True:
+            attempts_remaining -= 1
+            try:
+                client.delete_bucket(Bucket=bucket_name)
+                break
+            except client.exceptions.NoSuchBucket:
+                if self.bucket_not_exists(bucket_name):
+                    # Fast fail when the NoSuchBucket error is real.
+                    break
+                if attempts_remaining <= 0:
+                    raise
+                time.sleep(delay)
+
+        self.regions.pop(bucket_name, None)
 
     def remove_all_objects(self, bucket_name):
-        client = self.session.create_client(
-            's3', region_name=self.regions[bucket_name])
+        client = self.create_client_for_bucket(bucket_name)
         paginator = client.get_paginator('list_objects')
         pages = paginator.paginate(Bucket=bucket_name)
         key_names = []
@@ -702,23 +823,44 @@ class BaseS3CLICommand(unittest.TestCase):
             self.delete_key(bucket_name, key_name)
 
     def delete_key(self, bucket_name, key_name):
-        client = self.session.create_client(
-            's3', region_name=self.regions[bucket_name])
+        client = self.create_client_for_bucket(bucket_name)
         response = client.delete_object(Bucket=bucket_name, Key=key_name)
 
     def get_key_contents(self, bucket_name, key_name):
-        client = self.session.create_client(
-            's3', region_name=self.regions[bucket_name])
+        client = self.create_client_for_bucket(bucket_name)
         response = client.get_object(Bucket=bucket_name, Key=key_name)
         return response['Body'].read().decode('utf-8')
 
-    def key_exists(self, bucket_name, key_name):
-        client = self.session.create_client(
-            's3', region_name=self.regions[bucket_name])
+    def wait_bucket_exists(self, bucket_name, min_successes=3):
+        client = self.create_client_for_bucket(bucket_name)
+        waiter = client.get_waiter('bucket_exists')
+        for _ in range(min_successes):
+            waiter.wait(Bucket=bucket_name)
+
+    def bucket_not_exists(self, bucket_name):
+        client = self.create_client_for_bucket(bucket_name)
         try:
-            client.head_object(Bucket=bucket_name, Key=key_name)
+            client.head_bucket(Bucket=bucket_name)
             return True
-        except ClientError:
+        except ClientError as error:
+            if error.response.get('Code') == '404':
+                return False
+            raise
+
+    def key_exists(self, bucket_name, key_name, min_successes=3):
+        try:
+            self.wait_until_key_exists(
+                    bucket_name, key_name, min_successes=min_successes)
+            return True
+        except (ClientError, WaiterError):
+            return False
+
+    def key_not_exists(self, bucket_name, key_name, min_successes=3):
+        try:
+            self.wait_until_key_not_exists(
+                    bucket_name, key_name, min_successes=min_successes)
+            return True
+        except (ClientError, WaiterError):
             return False
 
     def list_buckets(self):
@@ -730,10 +872,32 @@ class BaseS3CLICommand(unittest.TestCase):
         return parsed['ContentType']
 
     def head_object(self, bucket_name, key_name):
-        client = self.session.create_client(
-            's3', region_name=self.regions[bucket_name])
+        client = self.create_client_for_bucket(bucket_name)
         response = client.head_object(Bucket=bucket_name, Key=key_name)
         return response
+
+    def wait_until_key_exists(self, bucket_name, key_name, extra_params=None,
+                              min_successes=3):
+        self._wait_for_key(bucket_name, key_name, extra_params,
+                           min_successes, exists=True)
+
+    def wait_until_key_not_exists(self, bucket_name, key_name, extra_params=None,
+                                  min_successes=3):
+        self._wait_for_key(bucket_name, key_name, extra_params,
+                           min_successes, exists=False)
+
+    def _wait_for_key(self, bucket_name, key_name, extra_params=None,
+                      min_successes=3, exists=True):
+        client = self.create_client_for_bucket(bucket_name)
+        if exists:
+            waiter = client.get_waiter('object_exists')
+        else:
+            waiter = client.get_waiter('object_not_exists')
+        params = {'Bucket': bucket_name, 'Key': key_name}
+        if extra_params is not None:
+            params.update(extra_params)
+        for _ in range(min_successes):
+            waiter.wait(**params)
 
     def assert_no_errors(self, p):
         self.assertEqual(
@@ -748,3 +912,18 @@ class BaseS3CLICommand(unittest.TestCase):
 class StringIOWithFileNo(StringIO):
     def fileno(self):
         return 0
+
+
+class TestEventHandler(object):
+    def __init__(self, handler=None):
+        self._handler = handler
+        self._called = False
+
+    @property
+    def called(self):
+        return self._called
+
+    def handler(self, **kwargs):
+        self._called = True
+        if self._handler is not None:
+            self._handler(**kwargs)

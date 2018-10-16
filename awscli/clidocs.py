@@ -15,10 +15,12 @@ import os
 from botocore import xform_name
 from botocore.docs.bcdoc.docevents import DOC_EVENTS
 from botocore.model import StringShape
+from botocore.utils import is_json_value_header
 
 from awscli import SCALAR_TYPES
 from awscli.argprocess import ParamShorthandDocGen
 from awscli.topictags import TopicTagDB
+from awscli.utils import find_service_and_method_in_event_name
 
 LOG = logging.getLogger(__name__)
 
@@ -28,7 +30,6 @@ class CLIDocumentEventHandler(object):
     def __init__(self, help_command):
         self.help_command = help_command
         self.register(help_command.session, help_command.event_class)
-        self.help_command.doc.translation_map = self.build_translation_map()
         self._arg_groups = self._build_arg_table_groups(help_command)
         self._documented_arg_groups = []
 
@@ -39,8 +40,10 @@ class CLIDocumentEventHandler(object):
                 arg_groups.setdefault(arg.group_name, []).append(arg)
         return arg_groups
 
-    def build_translation_map(self):
-        return dict()
+    def _get_argument_type_name(self, shape, default):
+        if is_json_value_header(shape):
+            return 'JSON'
+        return default
 
     def _map_handlers(self, session, event_class, mapfn):
         for event in DOC_EVENTS:
@@ -127,7 +130,8 @@ class CLIDocumentEventHandler(object):
             self._documented_arg_groups.append(argument.group_name)
         else:
             option_str = '%s <value>' % argument.cli_name
-        if not argument.required:
+        if not (argument.required
+                or getattr(argument, '_DOCUMENT_AS_REQUIRED', False)):
             option_str = '[%s]' % option_str
         doc.writeln('%s' % option_str)
 
@@ -158,7 +162,8 @@ class CLIDocumentEventHandler(object):
             self._documented_arg_groups.append(argument.group_name)
         else:
             name = '``%s``' % argument.cli_name
-        doc.write('%s (%s)\n' % (name, argument.cli_type_name))
+        doc.write('%s (%s)\n' % (name, self._get_argument_type_name(
+            argument.argument_model, argument.cli_type_name)))
         doc.style.indent()
         doc.include_doc_string(argument.documentation)
         self._document_enums(argument, doc)
@@ -240,13 +245,6 @@ class ProviderDocumentEventHandler(CLIDocumentEventHandler):
 
 class ServiceDocumentEventHandler(CLIDocumentEventHandler):
 
-    def build_translation_map(self):
-        d = {}
-        service_model = self.help_command.obj
-        for operation_name in service_model.operation_names:
-            d[operation_name] = xform_name(operation_name, '-')
-        return d
-
     # A service document has no synopsis.
     def doc_synopsis_start(self, help_command, **kwargs):
         pass
@@ -298,21 +296,41 @@ class ServiceDocumentEventHandler(CLIDocumentEventHandler):
 
 class OperationDocumentEventHandler(CLIDocumentEventHandler):
 
-    def build_translation_map(self):
-        operation_model = self.help_command.obj
-        d = {}
-        for cli_name, cli_argument in self.help_command.arg_table.items():
-            if cli_argument.argument_model is not None:
-                d[cli_argument.argument_model.name] = cli_name
-        for operation_name in operation_model.service_model.operation_names:
-            d[operation_name] = xform_name(operation_name, '-')
-        return d
+    AWS_DOC_BASE = 'https://docs.aws.amazon.com/goto/WebAPI'
 
     def doc_description(self, help_command, **kwargs):
         doc = help_command.doc
         operation_model = help_command.obj
         doc.style.h2('Description')
         doc.include_doc_string(operation_model.documentation)
+        self._add_webapi_crosslink(help_command)
+        self._add_top_level_args_reference(help_command)
+
+    def _add_top_level_args_reference(self, help_command):
+        help_command.doc.writeln('')
+        help_command.doc.write("See ")
+        help_command.doc.style.internal_link(
+            title="'aws help'",
+            page='/reference/index'
+        )
+        help_command.doc.writeln(' for descriptions of global parameters.')
+
+    def _add_webapi_crosslink(self, help_command):
+        doc = help_command.doc
+        operation_model = help_command.obj
+        service_model = operation_model.service_model
+        service_uid = service_model.metadata.get('uid')
+        if service_uid is None:
+            # If there's no service_uid in the model, we can't
+            # be certain if the generated cross link will work
+            # so we don't generate any crosslink info.
+            return
+        doc.style.new_paragraph()
+        doc.write("See also: ")
+        link = '%s/%s/%s' % (self.AWS_DOC_BASE, service_uid,
+                             operation_model.name)
+        doc.style.external_link(title="AWS API Documentation", link=link)
+        doc.writeln('')
 
     def _json_example_value_name(self, argument_model, include_enum_values=True):
         # If include_enum_values is True, then the valid enum values
@@ -372,12 +390,12 @@ class OperationDocumentEventHandler(CLIDocumentEventHandler):
             doc.style.dedent()
             doc.write('}')
         elif argument_model.type_name == 'structure':
-            doc.write('{')
-            doc.style.indent()
-            doc.style.new_line()
             self._doc_input_structure_members(doc, argument_model, stack)
 
     def _doc_input_structure_members(self, doc, argument_model, stack):
+        doc.write('{')
+        doc.style.indent()
+        doc.style.new_line()
         members = argument_model.members
         for i, member_name in enumerate(members):
             member_model = members[member_name]
@@ -397,12 +415,13 @@ class OperationDocumentEventHandler(CLIDocumentEventHandler):
             if i < len(members) - 1:
                 doc.write(',')
                 doc.style.new_line()
-            else:
-                doc.style.dedent()
-                doc.style.new_line()
+        doc.style.dedent()
+        doc.style.new_line()
         doc.write('}')
 
-    def doc_option_example(self, arg_name, help_command, **kwargs):
+    def doc_option_example(self, arg_name, help_command, event_name, **kwargs):
+        service_id, operation_name = \
+            find_service_and_method_in_event_name(event_name)
         doc = help_command.doc
         cli_argument = help_command.arg_table[arg_name]
         if cli_argument.group_name in self._arg_groups:
@@ -414,7 +433,7 @@ class OperationDocumentEventHandler(CLIDocumentEventHandler):
         docgen = ParamShorthandDocGen()
         if docgen.supports_shorthand(cli_argument.argument_model):
             example_shorthand_syntax = docgen.generate_shorthand_example(
-                cli_argument.cli_name, cli_argument.argument_model)
+                cli_argument, service_id, operation_name)
             if example_shorthand_syntax is None:
                 # If the shorthand syntax returns a value of None,
                 # this indicates to us that there is no example
@@ -492,7 +511,8 @@ class OperationDocumentEventHandler(CLIDocumentEventHandler):
     def _do_doc_member_for_output(self, doc, member_name, member_shape, stack):
         docs = member_shape.documentation
         if member_name:
-            doc.write('%s -> (%s)' % (member_name, member_shape.type_name))
+            doc.write('%s -> (%s)' % (member_name, self._get_argument_type_name(
+                                      member_shape, member_shape.type_name)))
         else:
             doc.write('(%s)' % member_shape.type_name)
         doc.style.indent()
@@ -515,6 +535,9 @@ class OperationDocumentEventHandler(CLIDocumentEventHandler):
         doc.style.dedent()
         doc.style.new_paragraph()
 
+    def doc_options_end(self, help_command, **kwargs):
+        self._add_top_level_args_reference(help_command)
+
 
 class TopicListerDocumentEventHandler(CLIDocumentEventHandler):
     DESCRIPTION = (
@@ -528,7 +551,6 @@ class TopicListerDocumentEventHandler(CLIDocumentEventHandler):
     def __init__(self, help_command):
         self.help_command = help_command
         self.register(help_command.session, help_command.event_class)
-        self.help_command.doc.translation_map = self.build_translation_map()
         self._topic_tag_db = TopicTagDB()
         self._topic_tag_db.load_json_index()
 

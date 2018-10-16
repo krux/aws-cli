@@ -22,8 +22,10 @@ at the man output, we look one step before at the generated rst output
 
 """
 from awscli.testutils import BaseAWSHelpOutputTest
+from awscli.testutils import FileCreator
 
 from awscli.compat import six
+from awscli.alias import AliasLoader
 import mock
 
 
@@ -177,6 +179,17 @@ class TestHelpOutput(BaseAWSHelpOutputTest):
         # .. _`:
         self.assert_not_contains('.. _`:')
 
+    def test_shorthand_flattens_list_of_single_member_structures(self):
+        self.driver.main(['elb', 'remove-tags', 'help'])
+        self.assert_contains("--tags Key1 Key2 Key3")
+
+    def test_deprecated_operations_not_documented(self):
+        self.driver.main(['s3api', 'help'])
+        self.assert_not_contains('get-bucket-lifecycle\n')
+        self.assert_not_contains('put-bucket-lifecycle\n')
+        self.assert_not_contains('get-bucket-notification\n')
+        self.assert_not_contains('put-bucket-notification\n')
+
 
 class TestRemoveDeprecatedCommands(BaseAWSHelpOutputTest):
     def assert_command_does_not_exist(self, service, command):
@@ -297,10 +310,10 @@ class TestStructureScalarHasNoExamples(BaseAWSHelpOutputTest):
         # Verify that if a structure does match our special case
         # (single element named "Value"), then we still document
         # the example syntax.
-        self.driver.main(['s3api', 'restore-object', 'help'])
-        self.assert_contains('Days=integer')
+        self.driver.main(['s3api', 'create-bucket', 'help'])
+        self.assert_contains('LocationConstraint=string')
         # Also should see the JSON syntax in the help output.
-        self.assert_contains('"Days": integer')
+        self.assert_contains('"LocationConstraint": ')
 
 
 class TestJSONListScalarDocs(BaseAWSHelpOutputTest):
@@ -375,6 +388,19 @@ class TestParametersCanBeHidden(BaseAWSHelpOutputTest):
         self.assert_not_contains('--starting-sequence-number')
 
 
+class TestCanDocumentAsRequired(BaseAWSHelpOutputTest):
+    def test_can_doc_as_required(self):
+        # This param is already marked as required, but to be
+        # explicit this is repeated here to make it more clear.
+        def doc_as_required(argument_table, **kwargs):
+            arg = argument_table['volume-arns']
+        self.driver.session.register('building-argument-table',
+                                     doc_as_required)
+        self.driver.main(['storagegateway', 'describe-cached-iscsi-volumes',
+                          'help'])
+        self.assert_not_contains('[--volume-arns <value>]')
+
+
 class TestEC2AuthorizeSecurityGroupNotRendered(BaseAWSHelpOutputTest):
     def test_deprecated_args_not_documented(self):
         self.driver.main(['ec2', 'authorize-security-group-ingress', 'help'])
@@ -415,3 +441,24 @@ class TestIotData(BaseAWSHelpOutputTest):
         self.assert_contains(
             'The default endpoint data.iot.[region].amazonaws.com is '
             'intended for testing purposes only.')
+
+
+class TestAliases(BaseAWSHelpOutputTest):
+    def setUp(self):
+        super(TestAliases, self).setUp()
+        self.files = FileCreator()
+        self.alias_file = self.files.create_file('alias', '[toplevel]\n')
+        self.driver.alias_loader = AliasLoader(self.alias_file)
+
+    def tearDown(self):
+        super(TestAliases, self).tearDown()
+        self.files.remove_all()
+
+    def add_alias(self, alias_name, alias_value):
+        with open(self.alias_file, 'a+') as f:
+            f.write('%s = %s\n' % (alias_name, alias_value))
+
+    def test_alias_not_in_main_help(self):
+        self.add_alias('my-alias', 'ec2 describe-regions')
+        self.driver.main(['help'])
+        self.assert_not_contains('my-alias')

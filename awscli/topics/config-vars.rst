@@ -60,15 +60,25 @@ General Options
 
 The AWS CLI has a few general options:
 
-=========== ========= ===================== ===================== ============================
-Variable    Option    Config Entry          Environment Variable  Description
-=========== ========= ===================== ===================== ============================
-profile     --profile N/A                   AWS_DEFAULT_PROFILE   Default profile name
------------ --------- --------------------- --------------------- ----------------------------
-region      --region  region                AWS_DEFAULT_REGION    Default AWS Region
------------ --------- --------------------- --------------------- ----------------------------
-output      --output  output                AWS_DEFAULT_OUTPUT    Default output style
-=========== ========= ===================== ===================== ============================
+==================== =========== ===================== ===================== ============================
+Variable             Option      Config Entry          Environment Variable  Description
+==================== =========== ===================== ===================== ============================
+profile              --profile   N/A                   AWS_PROFILE           Default profile name
+-------------------- ----------- --------------------- --------------------- ----------------------------
+region               --region    region                AWS_DEFAULT_REGION    Default AWS Region
+-------------------- ----------- --------------------- --------------------- ----------------------------
+output               --output    output                AWS_DEFAULT_OUTPUT    Default output style
+-------------------- ----------- --------------------- --------------------- ----------------------------
+cli_timestamp_format N/A         cli_timestamp_format  N/A                   Output format of timestamps
+-------------------- ----------- --------------------- --------------------- ----------------------------
+cli_follow_urlparam  N/A         cli_follow_urlparam   N/A                   Fetch URL url parameters
+-------------------- ----------- --------------------- --------------------- ----------------------------
+ca_bundle            --ca-bundle ca_bundle             AWS_CA_BUNDLE         CA Certificate Bundle
+-------------------- ----------- --------------------- --------------------- ----------------------------
+parameter_validation N/A         parameter_validation  N/A                   Toggles parameter validation
+-------------------- ----------- --------------------- --------------------- ----------------------------
+tcp_keepalive        N/A         tcp_keepalive         N/A                   Toggles TCP Keep-Alive
+==================== =========== ===================== ===================== ============================
 
 The third column, Config Entry, is the value you would specify in the AWS CLI
 config file.  By default, this location is ``~/.aws/config``.  If you need to
@@ -81,8 +91,30 @@ The valid values of the ``output`` configuration variable are:
 * table
 * text
 
+``cli_timestamp_format`` controls the format of timestamps displayed by the AWS CLI.
+The valid values of the ``cli_timestamp_format`` configuration variable are:
+
+* none - Display the timestamp exactly as received from the HTTP response.
+* iso8601 - Reformat timestamp using iso8601 in the UTC timezone.
+
+``cli_follow_urlparam`` controls whether or not the CLI will attempt to follow
+URL links in parameters that start with either prefix ``https://`` or
+``http://``.  The valid values of the ``cli_follow_urlparam`` configuration
+variable are:
+
+* true - This is the default value. With this configured the CLI will follow
+  any string parameters that start with ``https://`` or ``http://`` will be
+  fetched, and the downloaded content will be used as the parameter instead.
+* false - The CLI will not treat strings prefixed with ``https://`` or
+  ``http://`` any differently than normal string parameters.
+
+``parameter_validation`` controls whether parameter validation should occur
+when serializing requests. The default is True. You can disable parameter
+validation for performance reasons. Otherwise, it's recommended to leave
+parameter validation enabled.
+
 When you specify a profile, either using ``--profile profile-name`` or by
-setting a value for the ``AWS_DEFAULT_PROFILE`` environment variable, profile
+setting a value for the ``AWS_PROFILE`` environment variable, profile
 name you provide is used to find the corresponding section in the AWS CLI
 config file.  For example, specifying ``--profile development`` will instruct
 the AWS CLI to look for a section in the AWS CLI config file of
@@ -107,15 +139,19 @@ Credentials can be specified in several ways:
 * The AWS Shared Credential File
 * The AWS CLI config file
 
-=========== ===================== ===================== ============================
-Variable    Creds/Config Entry    Environment Variable  Description
-=========== ===================== ===================== ============================
-access_key  aws_access_key_id     AWS_ACCESS_KEY_ID     AWS Access Key
------------ --------------------- --------------------- ----------------------------
-secret_key  aws_secret_access_key AWS_SECRET_ACCESS_KEY AWS Secret Key
------------ --------------------- --------------------- ----------------------------
-token       aws_session_token     AWS_SESSION_TOKEN     AWS Token (temp credentials)
-=========== ===================== ===================== ============================
+============================= ============================= ================================= ==============================
+Variable                      Creds/Config Entry            Environment Variable              Description
+============================= ============================= ================================= ==============================
+access_key                    aws_access_key_id             AWS_ACCESS_KEY_ID                 AWS Access Key
+----------------------------- ----------------------------- --------------------------------- ------------------------------
+secret_key                    aws_secret_access_key         AWS_SECRET_ACCESS_KEY             AWS Secret Key
+----------------------------- ----------------------------- --------------------------------- ------------------------------
+token                         aws_session_token             AWS_SESSION_TOKEN                 AWS Token (temp credentials)
+----------------------------- ----------------------------- --------------------------------- ------------------------------
+metadata_service_timeout      metadata_service_timeout      AWS_METADATA_SERVICE_TIMEOUT      EC2 metadata creds timeout
+----------------------------- ----------------------------- --------------------------------- ------------------------------
+metadata_service_num_attempts metadata_service_num_attempts AWS_METADATA_SERVICE_NUM_ATTEMPTS EC2 metadata creds retry count
+============================= ============================= ================================= ==============================
 
 The second column specifies the name that you can specify in either the AWS CLI
 config file or the AWS Shared credentials file (``~/.aws/credentials``).
@@ -156,7 +192,11 @@ Precedence
 Credentials from environment variables have precedence over credentials from
 the shared credentials and AWS CLI config file.  Credentials specified in the
 shared credentials file have precedence over credentials in the AWS CLI config
-file.
+file. If ``AWS_PROFILE`` environment variable is set and the
+``AWS_ACCESS_KEY_ID`` and ``AWS_SECRET_ACCESS_KEY`` environment variables are
+set, then the credentials provided by  ``AWS_ACCESS_KEY_ID`` and
+``AWS_SECRET_ACCESS_KEY`` will override the credentials located in the
+profile provided by ``AWS_PROFILE``.
 
 
 Using AWS IAM Roles
@@ -175,8 +215,20 @@ You can specify the following configuration values for configuring an IAM role
 in the AWS CLI config file:
 
 * ``role_arn`` - The ARN of the role you want to assume.
-* ``source_profile`` - The AWS CLI profile that contains credentials we should
-  use for the initial ``assume-role`` call.
+* ``source_profile`` - The AWS CLI profile that contains credentials /
+  configuration the CLI should use for the initial ``assume-role`` call. This
+  profile may be another profile configured to use ``assume-role``, though
+  if static credentials are present in the profile they will take precedence.
+  This parameter cannot be provided alongside ``credential_source``.
+* ``credential_source`` - The credential provider to use to get credentials for
+  the initial ``assume-role`` call. This parameter cannot be provided
+  alongside ``source_profile``. Valid values are:
+
+  * ``Environment`` to pull source credentials from environment variables.
+  * ``Ec2InstanceMetadata`` to use the EC2 instance role as source credentials.
+  * ``EcsContainer`` to use the ECS container credentials as the source
+    credentials.
+
 * ``external_id`` - A unique identifier that is used by third parties to assume
   a role in their customers' accounts.  This maps to the ``ExternalId``
   parameter in the ``AssumeRole`` operation.  This is an optional parameter.
@@ -194,13 +246,13 @@ in the AWS CLI config file:
   session name will be automatically generated.
 
 If you do not have MFA authentication required, then you only need to specify a
-``role_arn`` and a ``source_profile``.
+``role_arn`` and either a ``source_profile`` or a ``credential_source``.
 
 When you specify a profile that has IAM role configuration, the AWS CLI
 will make an ``AssumeRole`` call to retrieve temporary credentials.  These
-credentials are then stored (in ``~/.aws/cache``).  Subsequent AWS CLI commands
-will use the cached temporary credentials until they expire, in which case the
-AWS CLI will automatically refresh credentials.
+credentials are then stored (in ``~/.aws/cli/cache``).  Subsequent AWS CLI
+commands will use the cached temporary credentials until they expire, in which
+case the AWS CLI will automatically refresh credentials.
 
 If you specify an ``mfa_serial``, then the first time an ``AssumeRole`` call is
 made, you will be prompted to enter the MFA code.  Subsequent commands will use
@@ -208,50 +260,125 @@ the cached temporary credentials.  However, when the temporary credentials
 expire, you will be re-prompted for another MFA code.
 
 
-Example configuration::
+Example configuration using ``source_profile``::
 
   # In ~/.aws/credentials:
   [development]
   aws_access_key_id=foo
-  aws_access_key_id=bar
+  aws_secret_access_key=bar
 
   # In ~/.aws/config
   [profile crossaccount]
   role_arn=arn:aws:iam:...
   source_profile=development
 
+Example configuration using ``credential_source`` to use the instance role as
+the source credentials for the assume role call::
+
+  # In ~/.aws/config
+  [profile crossaccount]
+  role_arn=arn:aws:iam:...
+  credential_source=Ec2InstanceMetadata
+
+
+Sourcing Credentials From External Processes
+--------------------------------------------
+
+.. warning::
+
+    The following describes a method of sourcing credentials from an external
+    process. This can potentially be dangerous, so proceed with caution. Other
+    credential providers should be preferred if at all possible. If using
+    this option, you should make sure that the config file is as locked down
+    as possible using security best practices for your operating system.
+
+If you have a method of sourcing credentials that isn't built in to the AWS
+CLI, you can integrate it by using ``credential_process`` in the config file.
+The AWS CLI will call that command exactly as given and then read json data
+from stdout. The process must write credentials to stdout in the following
+format::
+
+    {
+      "Version": 1,
+      "AccessKeyId": "",
+      "SecretAccessKey": "",
+      "SessionToken": "",
+      "Expiration": ""
+    }
+
+The ``Version`` key must be set to ``1``. This value may be bumped over time
+as the payload structure evolves.
+
+The ``Expiration`` key is an ISO8601 formatted timestamp. If the ``Expiration``
+key is not returned in stdout, the credentials are long term credentials that
+do not refresh. Otherwise the credentials are considered refreshable
+credentials and will be refreshed automatically. NOTE: Unlike with assume role
+credentials, the AWS CLI will NOT cache process credentials. If caching is
+needed, it must be implemented in the external process.
+
+The process can return a non-zero RC to indicate that an error occurred while
+retrieving credentials.
+
+Some process providers may need additional information in order to retrieve the
+appropriate credentials. This can be done via command line arguments. NOTE:
+command line options may be visible to process running on the same machine.
+
+Example configuration::
+
+    [profile dev]
+    credential_process = /opt/bin/awscreds-custom
+
+Example configuration with parameters::
+
+    [profile dev]
+    credential_process = /opt/bin/awscreds-custom --username monty
+
 
 Service Specific Configuration
 ==============================
 
+API Versions
+------------
 
-aws s3
-------
+The API version to use for a service can be set using the ``api_versions``
+key. To specify an API version, set the API version to the name of the service
+as a sub value for ``api_versions``.
 
-These values are only applicable for the ``aws s3`` commands.  These
-configuration values are sub values that must be specified under the top level
-``s3`` key.
-
-These are the configuration values you can set for S3:
-
-* ``max_concurrent_requests`` - The maximum number of concurrent requests.
-* ``max_queue_size`` - The maximum number of tasks in the task queue.
-* ``multipart_threshold`` - The size threshold where the CLI uses multipart
-  transfers.
-* ``multipart_chunksize`` - When using multipart transfers, this is the chunk
-  size that will be used.
-
-Example config::
+Example configuration::
 
     [profile development]
     aws_access_key_id=foo
     aws_secret_access_key=bar
-    s3 =
-      max_concurrent_requests = 20
-      max_queue_size = 10000
-      multipart_threshold = 64MB
-      multipart_chunksize = 16MB
+    api_versions =
+        ec2 = 2015-03-01
+        cloudfront = 2015-09-17
+
+By setting an API version for a service, it ensures that the interface for
+that service's commands is representative of the specified API version.
+
+In the example configuration, the ``ec2`` CLI commands will be representative
+of Amazon EC2's ``2015-03-01`` API version and the ``cloudfront`` CLI commands
+will be representative of Amazon CloudFront's ``2015-09-17`` API version.
 
 
-For a more in depth discussion of these S3 configuration values, see ``aws help
-s3-config``.
+Amazon S3
+---------
+
+There are a number of configuration variables specific to the S3 commands. See
+:doc:`s3-config` (``aws help topics s3-config``) for more details.
+
+
+OS Specific Configuration
+=========================
+
+Locale
+------
+
+If you have data stored in AWS that uses a particular encoding, you should make
+sure that your systems are configured to accept that encoding. For instance, if
+you have unicode characters as part of a key on EC2 you will need to make sure
+that your locale is set to a unicode-compatible locale. How you configure your
+locale will depend on your operating system and your specific IT requirements.
+One option for UNIX systems is the ``LC_ALL`` environment variable. Setting
+``LC_ALL=en_US.UTF-8``, for instance, would give you a United States English
+locale which is compatible with unicode.

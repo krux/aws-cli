@@ -36,7 +36,7 @@ class TestCreateSubscription(BaseAWSCommandParamsTest):
     def test_policy_from_paramfile(self, create_client_mock):
         client = Mock()
         # S3 mock calls
-        client.get_user.return_value = {'User': {'Arn': ':::::'}}
+        client.get_caller_identity.return_value = {'Account': ''}
         client.head_bucket.side_effect = ClientError(
             {'Error': {'Code': 404, 'Message': ''}}, 'HeadBucket')
         # CloudTrail mock call
@@ -65,9 +65,9 @@ class TestCloudTrailCommand(unittest.TestCase):
         self.subscribe = CloudTrailSubscribe(self.session)
         self.subscribe.region_name = 'us-east-1'
 
-        self.subscribe.iam = Mock()
-        self.subscribe.iam.get_user = Mock(
-            return_value={'User': {'Arn': '::::123:456'}})
+        self.subscribe.sts = Mock()
+        self.subscribe.sts.get_caller_identity = Mock(
+            return_value={'Account': '123456'})
 
         self.subscribe.s3 = Mock()
         self.subscribe.s3.meta.region_name = 'us-east-1'
@@ -94,16 +94,12 @@ class TestCloudTrailCommand(unittest.TestCase):
         create_client_calls = session.create_client.call_args_list
         self.assertEqual(
             create_client_calls, [
-                call('iam', verify=None, region_name=None),
+                call('sts', verify=None, region_name=None),
                 call('s3', verify=None, region_name=None),
                 call('sns', verify=None, region_name=None),
                 call('cloudtrail', verify=None, region_name=None),
             ]
         )
-        # We should also remove the error handler for S3.
-        # This can be removed once the client switchover is done.
-        subscribe_command.s3.meta.events.unregister.assert_called_with(
-            'after-call', unique_id='awscli-error-handler')
 
     def test_endpoint_url_is_only_used_for_cloudtrail(self):
         endpoint_url = 'https://mycloudtrail.awsamazon.com/'
@@ -115,7 +111,7 @@ class TestCloudTrailCommand(unittest.TestCase):
         create_client_calls = session.create_client.call_args_list
         self.assertEqual(
             create_client_calls, [
-                call('iam', verify=None, region_name=None),
+                call('sts', verify=None, region_name=None),
                 call('s3', verify=None, region_name=None),
                 call('sns', verify=None, region_name=None),
                 # Here we should inject the endpoint_url only for cloudtrail.
@@ -125,20 +121,25 @@ class TestCloudTrailCommand(unittest.TestCase):
         )
 
     def test_s3_create(self):
-        iam = self.subscribe.iam
+        sts = self.subscribe.sts
         s3 = self.subscribe.s3
         s3.head_bucket.side_effect = ClientError(
             {'Error': {'Code': '404', 'Message': ''}}, 'HeadBucket')
 
         self.subscribe.setup_new_bucket('test', 'logs')
 
-        iam.get_user.assert_called()
+        sts.get_caller_identity.assert_called_with()
 
-        s3.get_object.assert_called()
-        s3.create_bucket.assert_called()
-        s3.put_bucket_policy.assert_called()
+        s3.get_object.assert_called_with(
+            Bucket='awscloudtrail-policy-us-east-1',
+            Key='policy/S3/AWSCloudTrail-S3BucketPolicy-2014-12-17.json',
+        )
+        s3.create_bucket.assert_called_with(Bucket='test')
+        s3.put_bucket_policy.assert_called_with(
+            Bucket='test', Policy=u'{"Statement": []}'
+        )
 
-        s3.delete_bucket.assert_not_called()
+        self.assertFalse(s3.delete_bucket.called)
 
         args, kwargs = s3.create_bucket.call_args
         self.assertNotIn('create_bucket_configuration', kwargs)
@@ -192,12 +193,6 @@ class TestCloudTrailCommand(unittest.TestCase):
         with self.assertRaises(Exception):
             self.subscribe.setup_new_bucket('test', 'logs')
 
-        s3.create_bucket.assert_called()
-        s3.put_bucket_policy.assert_called()
-        s3.DeleteBucket.assert_called()
-
-        s3.put_bucket_policy = orig
-
     def test_s3_get_policy_fail(self):
         self.subscribe.s3.get_object = Mock(side_effect=Exception('Foo!'))
 
@@ -231,12 +226,19 @@ class TestCloudTrailCommand(unittest.TestCase):
 
         self.subscribe.setup_new_topic('test')
 
-        s3.get_object.assert_called()
-        sns.list_topics.assert_called()
-        sns.create_topic.assert_called()
-        sns.set_topic_attributes.assert_called()
+        s3.get_object.assert_called_with(
+            Bucket='awscloudtrail-policy-us-east-1',
+            Key='policy/SNS/AWSCloudTrail-SnsTopicPolicy-2014-12-17.json',
+        )
+        sns.list_topics.assert_called_with()
+        sns.create_topic.assert_called_with(Name='test')
+        sns.set_topic_attributes.assert_called_with(
+            AttributeName='Policy',
+            AttributeValue='{"Statement": []}',
+            TopicArn='foo',
+        )
 
-        sns.delete_topic.assert_not_called()
+        self.assertFalse(sns.delete_topic.called)
 
     def test_sns_uses_regionalized_policy(self):
         s3 = self.subscribe.s3

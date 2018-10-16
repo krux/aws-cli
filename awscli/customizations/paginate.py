@@ -27,7 +27,7 @@ import logging
 from functools import partial
 
 from botocore import xform_name
-from botocore.exceptions import DataNotFoundError
+from botocore.exceptions import DataNotFoundError, PaginationError
 from botocore import model
 
 from awscli.arguments import BaseCLIArgument
@@ -39,19 +39,37 @@ logger = logging.getLogger(__name__)
 STARTING_TOKEN_HELP = """
 <p>A token to specify where to start paginating.  This is the
 <code>NextToken</code> from a previously truncated response.</p>
+<p>For usage examples, see <a
+href="https://docs.aws.amazon.com/cli/latest/userguide/pagination.html"
+>Pagination</a> in the <i>AWS Command Line Interface User
+Guide</i>.</p>
 """
 
 MAX_ITEMS_HELP = """
-<p>The total number of items to return.  If the total number
-of items available is more than the value specified in
-max-items then a <code>NextToken</code> will
-be provided in the output that you can use to resume pagination.
-This <code>NextToken</code> response element should <b>not</b> be
-used directly outside of the AWS CLI.</p>
+<p>The total number of items to return in the command's output.
+If the total number of items available is more than the value
+specified, a <code>NextToken</code> is provided in the command's
+output.  To resume pagination, provide the
+<code>NextToken</code> value in the <code>starting-token</code>
+argument of a subsequent command.  <b>Do not</b> use the
+<code>NextToken</code> response element directly outside of the
+AWS CLI.</p>
+<p>For usage examples, see <a
+href="https://docs.aws.amazon.com/cli/latest/userguide/pagination.html"
+>Pagination</a> in the <i>AWS Command Line Interface User
+Guide</i>.</p>
 """
 
 PAGE_SIZE_HELP = """
-<p>The size of each page.<p>
+<p>The size of each page to get in the AWS service call.  This
+does not affect the number of items returned in the command's
+output.  Setting a smaller page size results in more calls to
+the AWS service, retrieving fewer items in each call.  This can
+help prevent the AWS service calls from timing out.</p>
+<p>For usage examples, see <a
+href="https://docs.aws.amazon.com/cli/latest/userguide/pagination.html"
+>Pagination</a> in the <i>AWS Command Line Interface User
+Guide</i>.</p>
 """
 
 
@@ -173,16 +191,33 @@ def check_should_enable_pagination(input_tokens, shadowed_args, argument_table,
             logger.debug("User has specified a manual pagination arg. "
                          "Automatically setting --no-paginate.")
             parsed_globals.paginate = False
-            # Because we've now disabled pagination, there's a chance that
-            # we were shadowing arguments.  For example, we inject a
-            # --max-items argument in unify_paging_params().  If the
-            # the operation also provides its own MaxItems (which we
-            # expose as --max-items) then our custom pagination arg
-            # was shadowing the customers arg.  When we turn pagination
-            # off we need to put back the original argument which is
-            # what we're doing here.
-            for key, value in shadowed_args.items():
-                argument_table[key] = value
+
+    if not parsed_globals.paginate:
+        ensure_paging_params_not_set(parsed_args, shadowed_args)
+        # Because pagination is now disabled, there's a chance that
+        # we were shadowing arguments.  For example, we inject a
+        # --max-items argument in unify_paging_params().  If the
+        # the operation also provides its own MaxItems (which we
+        # expose as --max-items) then our custom pagination arg
+        # was shadowing the customers arg.  When we turn pagination
+        # off we need to put back the original argument which is
+        # what we're doing here.
+        for key, value in shadowed_args.items():
+            argument_table[key] = value
+
+
+def ensure_paging_params_not_set(parsed_args, shadowed_args):
+    paging_params = ['starting_token', 'page_size', 'max_items']
+    shadowed_params = [p.replace('-', '_') for p in shadowed_args.keys()]
+    params_used = [p for p in paging_params if
+                   p not in shadowed_params and getattr(parsed_args, p, None)]
+
+    if len(params_used) > 0:
+        converted_params = ', '.join(
+            ["--" + p.replace('_', '-') for p in params_used])
+        raise PaginationError(
+            message="Cannot specify --no-paginate along with pagination "
+                    "arguments: %s" % converted_params)
 
 
 def _remove_existing_paging_arguments(argument_table, pagination_config):

@@ -13,7 +13,7 @@ Output::
        "Attachments": [],
        "Tags": [],
        "VolumeType": "gp2",
-       "VolumeId": "vol-1234abcd",
+       "VolumeId": "vol-1234567890abcdef0",
        "State": "creating",
        "SnapshotId": null,
        "CreateTime": "YYYY-MM-DDTHH:MM:SS.000Z",
@@ -26,7 +26,7 @@ This example command creates a new Provisioned IOPS (SSD) volume with 1000 provi
 
 Command::
 
-  aws ec2 create-volume --region us-east-1 --availability-zone us-east-1a --snapshot-id snap-abcd1234 --volume-type io1 --iops 1000
+  aws ec2 create-volume --region us-east-1 --availability-zone us-east-1a --snapshot-id snap-066877671789bd71b --volume-type io1 --iops 1000
 
 Output::
 
@@ -35,10 +35,18 @@ Output::
        "Attachments": [],
        "Tags": [],
        "VolumeType": "io1",
-       "VolumeId": "vol-1234abcd",
+       "VolumeId": "vol-1234567890abcdef0",
        "State": "creating",
        "Iops": 1000,
-       "SnapshotId": "snap-abcd1234",
+       "SnapshotId": "snap-066877671789bd71b",
        "CreateTime": "YYYY-MM-DDTHH:MM:SS.000Z",
        "Size": 500
    }
+
+**To create a volume with tags**
+
+This example creates a volume and applies two tags: ``purpose`` = ``production``, and ``cost-center`` = ``cc123``.
+
+Command::
+
+  aws ec2 create-volume --availability-zone us-east-1a --volume-type gp2 --size 80 --tag-specifications 'ResourceType=volume,Tags=[{Key=purpose,Value=production},{Key=cost-center,Value=cc123}]'

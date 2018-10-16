@@ -18,10 +18,9 @@ from awscli.compat import six
 from botocore.compat import OrderedDict, json
 
 from awscli import SCALAR_TYPES, COMPLEX_TYPES
-from awscli.paramfile import get_paramfile, ResourceLoadingError
-from awscli.paramfile import PARAMFILE_DISABLED
 from awscli import shorthand
-
+from awscli.utils import find_service_and_method_in_event_name
+from botocore.utils import is_json_value_header
 
 LOG = logging.getLogger('awscli.argprocess')
 
@@ -87,27 +86,6 @@ def unpack_argument(session, service_name, operation_name, cli_argument, value):
     return value
 
 
-def uri_param(event_name, param, value, **kwargs):
-    """Handler that supports param values from URIs.
-    """
-    cli_argument = param
-    qualified_param_name = '.'.join(event_name.split('.')[1:])
-    if qualified_param_name in PARAMFILE_DISABLED or \
-            getattr(cli_argument, 'no_paramfile', None):
-        return
-    else:
-        return _check_for_uri_param(cli_argument, value)
-
-
-def _check_for_uri_param(param, value):
-    if isinstance(value, list) and len(value) == 1:
-        value = value[0]
-    try:
-        return get_paramfile(value)
-    except ResourceLoadingError as e:
-        raise ParamError(param.cli_name, six.text_type(e))
-
-
 def detect_shape_structure(param):
     stack = []
     return _detect_shape_structure(param, stack)
@@ -165,8 +143,19 @@ def unpack_cli_arg(cli_argument, value):
                            cli_argument.cli_name)
 
 
+def _special_type(model):
+    # check if model is jsonvalue header and that value is serializable
+    if model.serialization.get('jsonvalue') and \
+       model.serialization.get('location') == 'header' and \
+       model.type_name == 'string':
+        return True
+    return False
+
+
 def _unpack_cli_arg(argument_model, value, cli_name):
-    if argument_model.type_name in SCALAR_TYPES:
+    if is_json_value_header(argument_model):
+        return _unpack_json_cli_arg(argument_model, value, cli_name)
+    elif argument_model.type_name in SCALAR_TYPES:
         return unpack_scalar_cli_arg(
             argument_model, value, cli_name)
     elif argument_model.type_name in COMPLEX_TYPES:
@@ -174,6 +163,15 @@ def _unpack_cli_arg(argument_model, value, cli_name):
             argument_model, value, cli_name)
     else:
         return six.text_type(value)
+
+
+def _unpack_json_cli_arg(argument_model, value, cli_name):
+    try:
+        return json.loads(value, object_pairs_hook=OrderedDict)
+    except ValueError as e:
+        raise ParamError(
+            cli_name, "Invalid JSON: %s\nJSON received: %s"
+            % (e, value))
 
 
 def _unpack_complex_cli_arg(argument_model, value, cli_name):
@@ -247,11 +245,39 @@ def _is_complex_shape(model):
 
 class ParamShorthand(object):
 
+    def _uses_old_list_case(self, service_id, operation_name, argument_name):
+        """
+        Determines whether a given operation for a service needs to use the
+        deprecated shorthand parsing case for lists of structures that only have
+        a single member.
+        """
+        cases = {
+            'firehose': {
+                'put-record-batch': ['records']
+            },
+            'workspaces': {
+                'reboot-workspaces': ['reboot-workspace-requests'],
+                'rebuild-workspaces': ['rebuild-workspace-requests'],
+                'terminate-workspaces': ['terminate-workspace-requests']
+            },
+            'elastic-load-balancing': {
+                'remove-tags': ['tags'],
+                'describe-instance-health': ['instances'],
+                'deregister-instances-from-load-balancer': ['instances'],
+                'register-instances-with-load-balancer': ['instances']
+            }
+        }
+        cases = cases.get(service_id, {}).get(operation_name, [])
+        return argument_name in cases
+
+
+class ParamShorthandParser(ParamShorthand):
+
     def __init__(self):
         self._parser = shorthand.ShorthandParser()
         self._visitor = shorthand.BackCompatVisitor()
 
-    def __call__(self, cli_argument, value, **kwargs):
+    def __call__(self, cli_argument, value, event_name, **kwargs):
         """Attempt to parse shorthand syntax for values.
 
         This is intended to be hooked up as an event handler (hence the
@@ -278,16 +304,22 @@ class ParamShorthand(object):
             be raised.
 
         """
+
         if not self._should_parse_as_shorthand(cli_argument, value):
             return
         else:
-            return self._parse_as_shorthand(cli_argument, value)
+            service_id, operation_name = \
+                find_service_and_method_in_event_name(event_name)
+            return self._parse_as_shorthand(
+                cli_argument, value, service_id, operation_name)
 
-    def _parse_as_shorthand(self, cli_argument, value):
+    def _parse_as_shorthand(self, cli_argument, value, service_id,
+                            operation_name):
         try:
             LOG.debug("Parsing param %s as shorthand",
                         cli_argument.cli_name)
-            handled_value = self._handle_special_cases(cli_argument, value)
+            handled_value = self._handle_special_cases(
+                cli_argument, value, service_id, operation_name)
             if handled_value is not None:
                 return handled_value
             if isinstance(value, list):
@@ -306,19 +338,21 @@ class ParamShorthand(object):
             raise ParamError(cli_argument.cli_name, str(e))
         except (ParamError, ParamUnknownKeyError) as e:
             # The shorthand parse methods don't have the cli_name,
-            # so any ParamError won't have this value.  To accomodate
+            # so any ParamError won't have this value.  To accommodate
             # this, ParamErrors are caught and reraised with the cli_name
             # injected.
             raise ParamError(cli_argument.cli_name, str(e))
         return parsed
 
-    def _handle_special_cases(self, cli_argument, value):
+    def _handle_special_cases(self, cli_argument, value, service_id,
+                              operation_name):
         # We need to handle a few special cases that the previous
         # parser handled in order to stay backwards compatible.
         model = cli_argument.argument_model
         if model.type_name == 'list' and \
-                model.member.type_name == 'structure' and \
-                len(model.member.members) == 1:
+           model.member.type_name == 'structure' and \
+           len(model.member.members) == 1 and \
+           self._uses_old_list_case(service_id, operation_name, cli_argument.name):
             # First special case is handling a list of structures
             # of a single element such as:
             #
@@ -365,7 +399,7 @@ class ParamShorthand(object):
         return _is_complex_shape(model)
 
 
-class ParamShorthandDocGen(object):
+class ParamShorthandDocGen(ParamShorthand):
     """Documentation generator for param shorthand syntax."""
 
     _DONT_DOC = object()
@@ -377,7 +411,8 @@ class ParamShorthandDocGen(object):
             return _is_complex_shape(argument_model)
         return False
 
-    def generate_shorthand_example(self, cli_name, argument_model):
+    def generate_shorthand_example(self, cli_argument, service_id,
+                                   operation_name):
         """Generate documentation for a CLI argument.
 
         :type cli_argument: awscli.arguments.BaseCLIArgument
@@ -391,7 +426,8 @@ class ParamShorthandDocGen(object):
             ``argument_model``.
 
         """
-        docstring = self._handle_special_cases(cli_name, argument_model)
+        docstring = self._handle_special_cases(
+            cli_argument, service_id, operation_name)
         if docstring is self._DONT_DOC:
             return None
         elif docstring:
@@ -401,20 +437,23 @@ class ParamShorthandDocGen(object):
         # syntax.
         stack = []
         try:
-            if argument_model.type_name == 'list':
-                argument_model = argument_model.member
+            if cli_argument.argument_model.type_name == 'list':
+                argument_model = cli_argument.argument_model.member
                 return self._shorthand_docs(argument_model, stack) + ' ...'
             else:
-                return self._shorthand_docs(argument_model, stack)
+                return self._shorthand_docs(cli_argument.argument_model, stack)
         except TooComplexError:
             return ''
 
-    def _handle_special_cases(self, cli_name, model):
+    def _handle_special_cases(self, cli_argument, service_id, operation_name):
+        model = cli_argument.argument_model
         if model.type_name == 'list' and \
                 model.member.type_name == 'structure' and \
-                len(model.member.members) == 1:
+                len(model.member.members) == 1 and \
+                self._uses_old_list_case(
+                    service_id, operation_name, cli_argument.name):
             member_name = list(model.member.members)[0]
-            return '%s %s1 %s2 %s3' % (cli_name, member_name,
+            return '%s %s1 %s2 %s3' % (cli_argument.cli_name, member_name,
                                        member_name, member_name)
         elif model.type_name == 'structure' and \
                 len(model.members) == 1 and \

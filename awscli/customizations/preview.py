@@ -38,9 +38,7 @@ logger = logging.getLogger(__name__)
 
 
 PREVIEW_SERVICES = [
-    'cloudfront',
     'sdb',
-    'efs',
 ]
 
 
