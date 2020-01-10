@@ -23,25 +23,19 @@ def find_version(*file_paths):
     raise RuntimeError("Unable to find version string.")
 
 
-requires = ['botocore==1.12.23',
-            'colorama>=0.2.5,<=0.3.9',
-            'docutils>=0.10',
-            'rsa>=3.1.2,<=3.5.0',
-            's3transfer>=0.1.12,<0.2.0',
-            'PyYAML>=3.10,<=3.13']
-
-
-if sys.version_info[:2] == (2, 6):
-    # For python2.6 we have to require argparse since it
-    # was not in stdlib until 2.7.
-    requires.append('argparse>=1.1')
+install_requires = ['botocore==1.13.50',
+                    'docutils>=0.10,<0.16',
+                    'rsa>=3.1.2,<=3.5.0',
+                    's3transfer>=0.2.0,<0.3.0',
+                    'PyYAML>=3.10,<5.3',
+                    'colorama>=0.2.5,<0.4.2']
 
 
 setup_options = dict(
     name='awscli',
     version=find_version("awscli", "__init__.py"),
     description='Universal Command Line Environment for AWS.',
-    long_description=open('README.rst').read(),
+    long_description=read('README.rst'),
     author='Amazon Web Services',
     url='http://aws.amazon.com/cli/',
     scripts=['bin/aws', 'bin/aws.cmd',
@@ -49,16 +43,13 @@ setup_options = dict(
              'bin/aws_bash_completer'],
     packages=find_packages(exclude=['tests*']),
     package_data={'awscli': ['data/*.json', 'examples/*/*.rst',
+                             'examples/*/*.txt', 'examples/*/*/*.txt',
                              'examples/*/*/*.rst', 'topics/*.rst',
                              'topics/*.json']},
-    install_requires=requires,
-    extras_require={
-        ':python_version=="2.6"': [
-            'argparse>=1.1',
-        ]
-    },
+    install_requires=install_requires,
+    extras_require={},
     license="Apache License 2.0",
-    classifiers=(
+    classifiers=[
         'Development Status :: 5 - Production/Stable',
         'Intended Audience :: Developers',
         'Intended Audience :: System Administrators',
@@ -66,16 +57,16 @@ setup_options = dict(
         'License :: OSI Approved :: Apache Software License',
         'Programming Language :: Python',
         'Programming Language :: Python :: 2',
-        'Programming Language :: Python :: 2.6',
         'Programming Language :: Python :: 2.7',
         'Programming Language :: Python :: 3',
-        'Programming Language :: Python :: 3.3',
         'Programming Language :: Python :: 3.4',
         'Programming Language :: Python :: 3.5',
         'Programming Language :: Python :: 3.6',
         'Programming Language :: Python :: 3.7',
-    ),
+        'Programming Language :: Python :: 3.8',
+    ],
 )
+
 
 if 'py2exe' in sys.argv:
     # This will actually give us a py2exe command.

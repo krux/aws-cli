@@ -8,7 +8,7 @@ Use this command to quickly upload local artifacts that might be required by
 your template. After you package your template's artifacts, run the deploy
 command to ``deploy`` the returned template.
 
-This command can upload local artifacts specified by following properties of a resource:
+This command can upload local artifacts referenced in the following places:
 
 
     - ``BodyS3Location`` property for the ``AWS::ApiGateway::RestApi`` resource
@@ -18,8 +18,10 @@ This command can upload local artifacts specified by following properties of a r
     - ``RequestMappingTemplateS3Location`` property for the ``AWS::AppSync::Resolver`` resource
     - ``ResponseMappingTemplateS3Location`` property for the ``AWS::AppSync::Resolver`` resource
     - ``DefinitionUri`` property for the ``AWS::Serverless::Api`` resource
+    - ``Location`` parameter for the ``AWS::Include`` transform
     - ``SourceBundle`` property for the ``AWS::ElasticBeanstalk::ApplicationVersion`` resource
     - ``TemplateURL`` property for the ``AWS::CloudFormation::Stack`` resource
+    - ``Command.ScriptLocation`` property for the ``AWS::Glue::Job`` resource
 
 
 To specify a local artifact in your template, specify a path to a local file or folder,
@@ -28,7 +30,7 @@ that is relative to your template's location.
 
 For example, if your AWS Lambda function source code is in the
 ``/home/user/code/lambdafunction/`` folder, specify
-`` CodeUri: /home/user/code/lambdafunction`` for the
+``CodeUri: /home/user/code/lambdafunction`` for the
 ``AWS::Serverless::Function`` resource. The command returns a template and replaces
 the local path with the S3 location: ``CodeUri: s3://mybucket/lambdafunction.zip``.
 
